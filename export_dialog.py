@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -36,6 +37,7 @@ class ExportOptions:
     scale: float
     fmt: str  # ".png" or ".tif"
     out_dir: str
+    export_rois: bool = False
 
 
 class ExportDialog(QDialog):
@@ -55,6 +57,9 @@ class ExportDialog(QDialog):
         scope_row.addWidget(self.scope_current)
         scope_row.addWidget(self.scope_all)
         form.addRow("Export:", scope_row)
+
+        self.roi_check = QCheckBox("Export ROI crops only (named by ROI, instead of the full composite)")
+        form.addRow("", self.roi_check)
 
         # LUT preset
         preset_row = QHBoxLayout()
@@ -143,4 +148,5 @@ class ExportDialog(QDialog):
             scale=scale,
             fmt=fmt,
             out_dir=self.out_dir_edit.text() or ".",
+            export_rois=self.roi_check.isChecked(),
         )

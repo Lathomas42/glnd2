@@ -45,6 +45,9 @@ class CompositeGLWidget(QOpenGLWidget):
     # Emits (distance_px, distance_um_or_None) when a two-click measurement
     # completes, or None when the current measurement is cleared/reset.
     measured = Signal(object)
+    # Emits (x, y, w, h) in image pixel coordinates when a rectangle ROI
+    # drag completes with a non-trivial size.
+    roiDrawn = Signal(float, float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,6 +70,11 @@ class CompositeGLWidget(QOpenGLWidget):
 
         self._measure_mode = False
         self._measure_points: list[tuple[float, float]] = []
+
+        self._roi_mode = False
+        self._roi_drag_start: tuple[float, float] | None = None
+        self._roi_drag_current: tuple[float, float] | None = None
+        self._rois: list = []  # objects with .name/.x/.y/.w/.h (roi_store.ROI)
 
         self.setMouseTracking(True)
         self.setMinimumSize(200, 200)
@@ -203,6 +211,9 @@ class CompositeGLWidget(QOpenGLWidget):
         self._zoom = 1.0
         self._pan = [0.0, 0.0]
         self._measure_points = []
+        self._rois = []
+        self._roi_drag_start = None
+        self._roi_drag_current = None
         self.doneCurrent()
         self.measured.emit(None)
         self.update()
@@ -229,8 +240,49 @@ class CompositeGLWidget(QOpenGLWidget):
     def set_measure_mode(self, on: bool):
         self._measure_mode = on
         self._measure_points = []
+        if on:
+            self._roi_mode = False
         self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
         self.measured.emit(None)
+        self.update()
+
+    def set_roi_mode(self, on: bool):
+        self._roi_mode = on
+        self._roi_drag_start = None
+        self._roi_drag_current = None
+        if on:
+            self._measure_mode = False
+        self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        self.update()
+
+    def set_rois(self, rois: list):
+        """Set the ROIs to draw as an overlay (typically all ROIs belonging
+        to the currently loaded file)."""
+        self._rois = rois
+        self.update()
+
+    def center_on_roi(self, x: float, y: float, w: float, h: float, fill: float = 0.7):
+        """Zoom/pan so the given image-space rectangle is centered and fills
+        about `fill` of the viewport."""
+        if not self._img_w or not self._img_h:
+            return
+        base_sx, base_sy = self._compute_scale(self.width(), self.height())
+        # base_sx/base_sy are the scale at zoom=1; back them out to get the
+        # zoom-independent "fit whole image" scale.
+        fit_sx = base_sx / self._zoom if self._zoom else base_sx
+        fit_sy = base_sy / self._zoom if self._zoom else base_sy
+
+        frac_w = max(w / self._img_w, 1e-6)
+        frac_h = max(h / self._img_h, 1e-6)
+        zoom_x = fill / (frac_w * fit_sx) if fit_sx else 1.0
+        zoom_y = fill / (frac_h * fit_sy) if fit_sy else 1.0
+        self._zoom = max(0.1, min(60.0, min(zoom_x, zoom_y)))
+
+        sx, sy = self._compute_scale(self.width(), self.height())
+        cx, cy = x + w / 2.0, y + h / 2.0
+        u, v = cx / self._img_w, cy / self._img_h
+        apos_x, apos_y = 2.0 * u - 1.0, 1.0 - 2.0 * v
+        self._pan = [-apos_x * sx, -apos_y * sy]
         self.update()
 
     # ------------------------------------------------------------------
@@ -286,10 +338,13 @@ class CompositeGLWidget(QOpenGLWidget):
         return dist_px, dist_um
 
     def _draw(self, vp_w: int, vp_h: int):
-        gl.glUseProgram(self._program)
         sx, sy = self._compute_scale(vp_w, vp_h)
-        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uScale"), sx, sy)
-        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uPan"), self._pan[0], self._pan[1])
+        self._draw_with_transform(sx, sy, self._pan[0], self._pan[1])
+
+    def _draw_with_transform(self, scale_x: float, scale_y: float, pan_x: float, pan_y: float):
+        gl.glUseProgram(self._program)
+        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uScale"), scale_x, scale_y)
+        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uPan"), pan_x, pan_y)
         gl.glUniform1i(gl.glGetUniformLocation(self._program, "uCount"), len(self._states))
 
         for i, st in enumerate(self._states):
@@ -316,20 +371,9 @@ class CompositeGLWidget(QOpenGLWidget):
             return
         self._draw(self.width(), self.height())
 
-    def render_to_array(self, scale: float = 1.0) -> np.ndarray | None:
-        """Render the composite off-screen at `scale` * source resolution.
-
-        `scale=1.0` renders at full native resolution; `scale=0.5` renders
-        directly at half resolution on the GPU (cheaper than rendering full
-        size and shrinking afterwards). Returns an (H, W, 3) uint8 RGB
-        numpy array, or None if no image is loaded.
-        """
-        if not self._states or not self._img_w or not self._img_h:
-            return None
-
-        out_w = max(1, round(self._img_w * scale))
-        out_h = max(1, round(self._img_h * scale))
-
+    def _render_offscreen(self, out_w: int, out_h: int, draw_fn) -> np.ndarray:
+        """Render into an off-screen FBO of the given size, calling `draw_fn()`
+        to issue the actual draw call, and return an (H, W, 3) uint8 RGB array."""
         self.makeCurrent()
         fbo = gl.glGenFramebuffers(1)
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
@@ -354,12 +398,7 @@ class CompositeGLWidget(QOpenGLWidget):
 
         gl.glViewport(0, 0, out_w, out_h)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-        # Export always shows the full image regardless of the interactive
-        # pan/zoom currently on screen.
-        saved_zoom, saved_pan = self._zoom, self._pan
-        self._zoom, self._pan = 1.0, [0.0, 0.0]
-        self._draw(out_w, out_h)
-        self._zoom, self._pan = saved_zoom, saved_pan
+        draw_fn()
         gl.glFinish()
 
         pixels = gl.glReadPixels(0, 0, out_w, out_h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
@@ -372,6 +411,50 @@ class CompositeGLWidget(QOpenGLWidget):
         gl.glViewport(0, 0, self.width(), self.height())
         self.doneCurrent()
         return arr
+
+    def render_to_array(self, scale: float = 1.0) -> np.ndarray | None:
+        """Render the full composite off-screen at `scale` * source resolution.
+
+        `scale=1.0` renders at full native resolution; `scale=0.5` renders
+        directly at half resolution on the GPU (cheaper than rendering full
+        size and shrinking afterwards). Returns an (H, W, 3) uint8 RGB
+        numpy array, or None if no image is loaded. Always shows the full
+        image regardless of the interactive pan/zoom currently on screen.
+        """
+        if not self._states or not self._img_w or not self._img_h:
+            return None
+        out_w = max(1, round(self._img_w * scale))
+        out_h = max(1, round(self._img_h * scale))
+        saved_zoom, saved_pan = self._zoom, self._pan
+        self._zoom, self._pan = 1.0, [0.0, 0.0]
+        try:
+            return self._render_offscreen(out_w, out_h, lambda: self._draw(out_w, out_h))
+        finally:
+            self._zoom, self._pan = saved_zoom, saved_pan
+
+    def render_region_to_array(self, x: float, y: float, w: float, h: float,
+                                scale: float = 1.0) -> np.ndarray | None:
+        """Render just the given image-space rectangle (in current, possibly
+        downsample-adjusted pixel coordinates), scaled by `scale`, filling
+        the whole output. Used for exporting ROI crops."""
+        if not self._states or not self._img_w or not self._img_h or w <= 0 or h <= 0:
+            return None
+        out_w = max(1, round(w * scale))
+        out_h = max(1, round(h * scale))
+
+        u0, u1 = x / self._img_w, (x + w) / self._img_w
+        v0, v1 = y / self._img_h, (y + h) / self._img_h
+        apos_x0, apos_x1 = 2.0 * u0 - 1.0, 2.0 * u1 - 1.0
+        apos_y0, apos_y1 = 1.0 - 2.0 * v1, 1.0 - 2.0 * v0
+        scale_x = 2.0 / (apos_x1 - apos_x0) if apos_x1 != apos_x0 else 1.0
+        scale_y = 2.0 / (apos_y1 - apos_y0) if apos_y1 != apos_y0 else 1.0
+        pan_x = -1.0 - apos_x0 * scale_x
+        pan_y = -1.0 - apos_y0 * scale_y
+
+        return self._render_offscreen(
+            out_w, out_h,
+            lambda: self._draw_with_transform(scale_x, scale_y, pan_x, pan_y),
+        )
 
     # ------------------------------------------------------------------
     # Interaction: wheel to zoom, drag to pan, double-click to reset
@@ -399,11 +482,27 @@ class CompositeGLWidget(QOpenGLWidget):
                 self.update()
             return
 
+        if self._roi_mode:
+            if event.button() == Qt.LeftButton:
+                img_pt = self._screen_to_image(event.position().x(), event.position().y())
+                self._roi_drag_start = img_pt
+                self._roi_drag_current = img_pt
+                self.update()
+            elif event.button() == Qt.RightButton:
+                self._roi_drag_start = None
+                self._roi_drag_current = None
+                self.update()
+            return
+
         if event.button() == Qt.LeftButton:
             self._drag_start = event.position()
             self._pan_start = tuple(self._pan)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._roi_mode and self._roi_drag_start is not None:
+            self._roi_drag_current = self._screen_to_image(event.position().x(), event.position().y())
+            self.update()
+            return
         if self._drag_start is not None:
             d = event.position() - self._drag_start
             self._pan[0] = self._pan_start[0] + 2.0 * d.x() / max(self.width(), 1)
@@ -411,21 +510,40 @@ class CompositeGLWidget(QOpenGLWidget):
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._roi_mode and event.button() == Qt.LeftButton and self._roi_drag_start is not None:
+            (x1, y1), (x2, y2) = self._roi_drag_start, self._roi_drag_current
+            x, y = min(x1, x2), min(y1, y2)
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            self._roi_drag_start = None
+            self._roi_drag_current = None
+            self.update()
+            if w >= 5 and h >= 5:  # ignore accidental clicks/tiny drags
+                self.roiDrawn.emit(x, y, w, h)
+            return
         self._drag_start = None
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if not self._measure_mode:
+        if not self._measure_mode and not self._roi_mode:
             self.reset_view()
 
     # ------------------------------------------------------------------
-    # Measurement overlay (drawn with QPainter on top of the GL content)
+    # Measurement / ROI overlay (drawn with QPainter on top of the GL content)
     # ------------------------------------------------------------------
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._measure_points:
+        if not self._measure_points and not self._rois and not self._roi_drag_start:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
+        self._paint_measure_overlay(painter)
+        self._paint_roi_overlay(painter)
+
+        painter.end()
+
+    def _paint_measure_overlay(self, painter: QPainter):
+        if not self._measure_points:
+            return
         points = [self._image_to_screen(px, py) for px, py in self._measure_points]
 
         pen = QPen(QColor(255, 235, 59), 2)
@@ -441,4 +559,22 @@ class CompositeGLWidget(QOpenGLWidget):
             label = f"{dist_um:.2f} µm" if dist_um is not None else f"{dist_px:.1f} px"
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.drawText(QPointF((x1 + x2) / 2 + 8, (y1 + y2) / 2 - 8), label)
-        painter.end()
+
+    def _paint_roi_overlay(self, painter: QPainter):
+        painter.setBrush(Qt.NoBrush)
+        roi_pen = QPen(QColor(0, 230, 180), 2)
+        for roi in self._rois:
+            x0, y0 = self._image_to_screen(roi.x, roi.y)
+            x1, y1 = self._image_to_screen(roi.x + roi.w, roi.y + roi.h)
+            painter.setPen(roi_pen)
+            painter.drawRect(x0, y0, x1 - x0, y1 - y0)
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.drawText(QPointF(min(x0, x1) + 4, min(y0, y1) + 16), roi.name)
+
+        if self._roi_drag_start is not None and self._roi_drag_current is not None:
+            (ix1, iy1), (ix2, iy2) = self._roi_drag_start, self._roi_drag_current
+            x0, y0 = self._image_to_screen(min(ix1, ix2), min(iy1, iy2))
+            x1, y1 = self._image_to_screen(max(ix1, ix2), max(iy1, iy2))
+            pen = QPen(QColor(255, 150, 0), 2, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(x0, y0, x1 - x0, y1 - y0)

@@ -12,8 +12,10 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QDialog,
+    QDockWidget,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 import nd2_loader
+import roi_store
 from channel_panel import ChannelPanel
 from export_dialog import ExportDialog
 from gl_widget import ChannelState, CompositeGLWidget
@@ -72,6 +75,9 @@ class MainWindow(QMainWindow):
         self._last_out_dir: str | None = None
         self._last_preset_path: str | None = None
 
+        self._rois: list[roi_store.ROI] = []
+        self._pending_center_roi: roi_store.ROI | None = None
+
         self._settings = QSettings("glnd2", "glnd2")
         self._default_lut_path: str | None = self._settings.value("default_lut_path", None)
         self._use_default_lut: bool = self._settings.value("use_default_lut", False, type=bool)
@@ -107,6 +113,7 @@ class MainWindow(QMainWindow):
         # center: GL composite view
         self.gl = CompositeGLWidget()
         self.gl.measured.connect(self._on_measured)
+        self.gl.roiDrawn.connect(self._on_roi_drawn)
         splitter.addWidget(self.gl)
 
         # right: channel controls
@@ -125,6 +132,25 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([260, 950, 380])
         self.setCentralWidget(splitter)
+
+        # ROI dock: browsable list of rectangle ROIs, click to jump to one
+        roi_dock = QDockWidget("ROIs", self)
+        roi_dock_widget = QWidget()
+        roi_dock_layout = QVBoxLayout(roi_dock_widget)
+        roi_dock_layout.setContentsMargins(4, 4, 4, 4)
+        self.roi_list = QListWidget()
+        self.roi_list.itemClicked.connect(self._on_roi_list_clicked)
+        roi_dock_layout.addWidget(self.roi_list, 1)
+        roi_btn_row = QHBoxLayout()
+        roi_rename_btn = QPushButton("Rename")
+        roi_rename_btn.clicked.connect(self._rename_selected_roi)
+        roi_delete_btn = QPushButton("Delete")
+        roi_delete_btn.clicked.connect(self._delete_selected_roi)
+        roi_btn_row.addWidget(roi_rename_btn)
+        roi_btn_row.addWidget(roi_delete_btn)
+        roi_dock_layout.addLayout(roi_btn_row)
+        roi_dock.setWidget(roi_dock_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, roi_dock)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -179,11 +205,17 @@ class MainWindow(QMainWindow):
         act_reset_view.triggered.connect(self.gl.reset_view)
         tb.addAction(act_reset_view)
 
-        act_measure = QAction("Measure", self)
-        act_measure.setCheckable(True)
-        act_measure.setShortcut(QKeySequence("Ctrl+M"))
-        act_measure.toggled.connect(self.gl.set_measure_mode)
-        tb.addAction(act_measure)
+        self.act_measure = QAction("Measure", self)
+        self.act_measure.setCheckable(True)
+        self.act_measure.setShortcut(QKeySequence("Ctrl+M"))
+        self.act_measure.toggled.connect(self._on_measure_toggled)
+        tb.addAction(self.act_measure)
+
+        self.act_roi = QAction("Draw ROI", self)
+        self.act_roi.setCheckable(True)
+        self.act_roi.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_roi.toggled.connect(self._on_roi_mode_toggled)
+        tb.addAction(self.act_roi)
         tb.addSeparator()
 
         act_save_preset = QAction("Save Preset…", self)
@@ -223,6 +255,9 @@ class MainWindow(QMainWindow):
         self._folder = folder
         self._files = files
         self._carried_states = {}
+        self._rois = roi_store.load_rois(folder)
+        self._pending_center_roi = None
+        self._refresh_roi_list()
         self.file_list.blockSignals(True)
         self.file_list.clear()
         for f in files:
@@ -275,6 +310,13 @@ class MainWindow(QMainWindow):
             f"({img.width}×{img.height}, {len(img.channels)} ch){warn}"
         )
 
+        fname = os.path.basename(img.path)
+        self.gl.set_rois([r for r in self._rois if r.file == fname])
+        if self._pending_center_roi is not None and self._pending_center_roi.file == fname:
+            roi = self._pending_center_roi
+            self._pending_center_roi = None
+            self.gl.center_on_roi(roi.x, roi.y, roi.w, roi.h)
+
     def _on_measured(self, result):
         if result is None:
             return
@@ -283,6 +325,72 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Measured: {dist_um:.2f} µm  ({dist_px:.1f} px)")
         else:
             self.status_label.setText(f"Measured: {dist_px:.1f} px  (no pixel calibration in this file)")
+
+    def _on_measure_toggled(self, checked: bool):
+        self.gl.set_measure_mode(checked)
+        if checked:
+            self.act_roi.setChecked(False)
+
+    def _on_roi_mode_toggled(self, checked: bool):
+        self.gl.set_roi_mode(checked)
+        if checked:
+            self.act_measure.setChecked(False)
+
+    def _on_roi_drawn(self, x: float, y: float, w: float, h: float):
+        if not (0 <= self._current_index < len(self._files)):
+            return
+        name, ok = QInputDialog.getText(self, "Name ROI", "Name:")
+        if not ok or not name.strip():
+            return
+        fname = self._files[self._current_index]
+        roi = roi_store.ROI.new(name.strip(), fname, x, y, w, h)
+        self._rois.append(roi)
+        roi_store.save_rois(self._folder, self._rois)
+        self._refresh_roi_list()
+        self.gl.set_rois([r for r in self._rois if r.file == fname])
+
+    def _refresh_roi_list(self):
+        self.roi_list.clear()
+        for roi in sorted(self._rois, key=lambda r: (r.file, r.name.lower())):
+            item = QListWidgetItem(f"{roi.name}  —  {roi.file}")
+            item.setData(Qt.UserRole, roi)
+            self.roi_list.addItem(item)
+
+    def _on_roi_list_clicked(self, item: QListWidgetItem):
+        roi: roi_store.ROI = item.data(Qt.UserRole)
+        if not (0 <= self._current_index < len(self._files)) or self._files[self._current_index] != roi.file:
+            if roi.file not in self._files:
+                QMessageBox.warning(self, "File not found", f"{roi.file} is not in the current folder.")
+                return
+            self._pending_center_roi = roi
+            self.file_list.setCurrentRow(self._files.index(roi.file))
+        else:
+            self.gl.center_on_roi(roi.x, roi.y, roi.w, roi.h)
+
+    def _rename_selected_roi(self):
+        item = self.roi_list.currentItem()
+        if item is None:
+            return
+        roi: roi_store.ROI = item.data(Qt.UserRole)
+        name, ok = QInputDialog.getText(self, "Rename ROI", "Name:", text=roi.name)
+        if not ok or not name.strip():
+            return
+        roi.name = name.strip()
+        roi_store.save_rois(self._folder, self._rois)
+        self._refresh_roi_list()
+        if 0 <= self._current_index < len(self._files) and self._files[self._current_index] == roi.file:
+            self.gl.set_rois([r for r in self._rois if r.file == roi.file])
+
+    def _delete_selected_roi(self):
+        item = self.roi_list.currentItem()
+        if item is None:
+            return
+        roi: roi_store.ROI = item.data(Qt.UserRole)
+        self._rois.remove(roi)
+        roi_store.save_rois(self._folder, self._rois)
+        self._refresh_roi_list()
+        if 0 <= self._current_index < len(self._files) and self._files[self._current_index] == roi.file:
+            self.gl.set_rois([r for r in self._rois if r.file == roi.file])
 
     def _on_load_failed(self, err: str):
         QMessageBox.critical(self, "Failed to load ND2", err)
@@ -322,11 +430,7 @@ class MainWindow(QMainWindow):
         base = os.path.splitext(self._files[self._current_index])[0]
         return os.path.join(self._folder, f"{base}_composite{ext}")
 
-    def _render_and_save(self, out_path: str, scale: float = 1.0) -> bool:
-        arr = self.gl.render_to_array(scale=scale)
-        if arr is None:
-            QMessageBox.warning(self, "Nothing to save", "No image is loaded.")
-            return False
+    def _save_array(self, arr: np.ndarray, out_path: str) -> bool:
         try:
             if out_path.lower().endswith((".tif", ".tiff")):
                 import tifffile
@@ -338,6 +442,27 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(e))
             return False
         return True
+
+    def _render_and_save(self, out_path: str, scale: float = 1.0) -> bool:
+        arr = self.gl.render_to_array(scale=scale)
+        if arr is None:
+            QMessageBox.warning(self, "Nothing to save", "No image is loaded.")
+            return False
+        return self._save_array(arr, out_path)
+
+    def _export_roi_crops(self, fname: str, out_dir: str, fmt: str, scale: float) -> int:
+        """Export each ROI belonging to `fname` as its own cropped image,
+        named `<basename>_<ROIName><ext>`. Returns the number exported."""
+        count = 0
+        for roi in [r for r in self._rois if r.file == fname]:
+            arr = self.gl.render_region_to_array(roi.x, roi.y, roi.w, roi.h, scale=scale)
+            if arr is None:
+                continue
+            base = os.path.splitext(fname)[0]
+            out_path = os.path.join(out_dir, f"{base}_{roi_store.safe_name(roi.name)}{fmt}")
+            if self._save_array(arr, out_path):
+                count += 1
+        return count
 
     def save_composite(self):
         out_path = self._default_out_path(".png")
@@ -403,20 +528,40 @@ class MainWindow(QMainWindow):
                         f"values instead: {', '.join(sorted(missing))}\n\n"
                         f"Preset has: {', '.join(sorted(preset_names))}",
                     )
+            if opts.export_rois:
+                n = self._export_roi_crops(fname, opts.out_dir, opts.fmt, opts.scale)
+                self.status_label.setText(
+                    f"Exported {n} ROI crop(s) to {opts.out_dir}" if n
+                    else f"No ROIs found for {fname}"
+                )
+                return
             out_path = os.path.join(opts.out_dir, f"{os.path.splitext(fname)[0]}_composite{opts.fmt}")
             if self._render_and_save(out_path, scale=opts.scale):
                 self.status_label.setText(f"Exported {out_path}")
             return
 
-        self._export_all_files(opts.out_dir, opts.fmt, opts.scale, preset_names=preset_names)
+        if opts.export_rois and not self._rois:
+            QMessageBox.information(self, "No ROIs", "No ROIs have been drawn in this folder.")
+            return
 
-    def _export_all_files(self, out_dir: str, fmt: str, scale: float, preset_names: set[str] | None = None):
-        progress = QProgressDialog("Exporting composites…", "Cancel", 0, len(self._files), self)
+        self._export_all_files(opts.out_dir, opts.fmt, opts.scale, preset_names=preset_names,
+                                export_rois=opts.export_rois)
+
+    def _export_all_files(self, out_dir: str, fmt: str, scale: float, preset_names: set[str] | None = None,
+                           export_rois: bool = False):
+        if export_rois:
+            roi_files = {r.file for r in self._rois}
+            target_files = [f for f in self._files if f in roi_files]
+        else:
+            target_files = self._files
+
+        progress = QProgressDialog("Exporting composites…", "Cancel", 0, len(target_files), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
         unmatched: dict[str, set[str]] = {}
-        for i, fname in enumerate(self._files):
+        roi_count = 0
+        for i, fname in enumerate(target_files):
             if progress.wasCanceled():
                 break
             progress.setValue(i)
@@ -438,10 +583,14 @@ class MainWindow(QMainWindow):
             effective = self._effective_carried_states([c.name for c in img.channels])
             self.gl.set_image(img, carried_states=effective)
             self._carried_states.update({st.name: st for st in self.gl.get_states()})
-            out_path = os.path.join(out_dir, f"{os.path.splitext(fname)[0]}_composite{fmt}")
-            self._render_and_save(out_path, scale=scale)
 
-        progress.setValue(len(self._files))
+            if export_rois:
+                roi_count += self._export_roi_crops(fname, out_dir, fmt, scale)
+            else:
+                out_path = os.path.join(out_dir, f"{os.path.splitext(fname)[0]}_composite{fmt}")
+                self._render_and_save(out_path, scale=scale)
+
+        progress.setValue(len(target_files))
 
         if unmatched:
             lines = [f"{fname}: {', '.join(sorted(names))}" for fname, names in unmatched.items()]
@@ -452,7 +601,7 @@ class MainWindow(QMainWindow):
                 + ("\n…" if len(lines) > 15 else ""),
             )
 
-        self.status_label.setText("Export complete")
+        self.status_label.setText(f"Exported {roi_count} ROI crop(s)" if export_rois else "Export complete")
         # Reload currently-selected file so the on-screen view matches the list selection.
         if 0 <= self._current_index < len(self._files):
             self._load_file(os.path.join(self._folder, self._files[self._current_index]))
