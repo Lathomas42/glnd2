@@ -1,0 +1,8 @@
+nd2
+numpy
+dask
+PySide6
+PyOpenGL
+tifffile
+imagecodecs
+Pillow
