@@ -6,7 +6,7 @@ import re
 import traceback
 
 import numpy as np
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QSettings, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -72,6 +72,18 @@ class MainWindow(QMainWindow):
         self._last_out_dir: str | None = None
         self._last_preset_path: str | None = None
 
+        self._settings = QSettings("glnd2", "glnd2")
+        self._default_lut_path: str | None = self._settings.value("default_lut_path", None)
+        self._use_default_lut: bool = self._settings.value("use_default_lut", False, type=bool)
+        self._default_lut_data: dict | None = None
+        if self._default_lut_path and os.path.exists(self._default_lut_path):
+            try:
+                with open(self._default_lut_path) as f:
+                    self._default_lut_data = json.load(f)
+            except Exception:
+                self._default_lut_data = None
+                self._default_lut_path = None
+
         self._build_ui()
         self._build_actions()
 
@@ -94,6 +106,7 @@ class MainWindow(QMainWindow):
 
         # center: GL composite view
         self.gl = CompositeGLWidget()
+        self.gl.measured.connect(self._on_measured)
         splitter.addWidget(self.gl)
 
         # right: channel controls
@@ -165,6 +178,12 @@ class MainWindow(QMainWindow):
         act_reset_view = QAction("Reset View", self)
         act_reset_view.triggered.connect(self.gl.reset_view)
         tb.addAction(act_reset_view)
+
+        act_measure = QAction("Measure", self)
+        act_measure.setCheckable(True)
+        act_measure.setShortcut(QKeySequence("Ctrl+M"))
+        act_measure.toggled.connect(self.gl.set_measure_mode)
+        tb.addAction(act_measure)
         tb.addSeparator()
 
         act_save_preset = QAction("Save Preset…", self)
@@ -174,6 +193,18 @@ class MainWindow(QMainWindow):
         act_load_preset = QAction("Load Preset…", self)
         act_load_preset.triggered.connect(self.load_preset)
         tb.addAction(act_load_preset)
+        tb.addSeparator()
+
+        act_set_default_lut = QAction("Set Default LUT…", self)
+        act_set_default_lut.triggered.connect(self.set_default_lut)
+        tb.addAction(act_set_default_lut)
+
+        self.act_use_default_lut = QAction("Use Default LUT", self)
+        self.act_use_default_lut.setCheckable(True)
+        self.act_use_default_lut.setChecked(self._use_default_lut)
+        self.act_use_default_lut.setEnabled(self._default_lut_data is not None)
+        self.act_use_default_lut.toggled.connect(self._toggle_use_default_lut)
+        tb.addAction(self.act_use_default_lut)
 
     # ------------------------------------------------------------------
     # Folder / file navigation
@@ -230,7 +261,8 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_loaded(self, img: nd2_loader.Nd2Image):
-        self.gl.set_image(img, carried_states=self._carried_states)
+        effective = self._effective_carried_states([c.name for c in img.channels])
+        self.gl.set_image(img, carried_states=effective)
         self._rebuild_panels(img)
         # Merge, don't replace: a file with fewer channels than a previous
         # one (e.g. a single-channel acquisition mixed into a folder of
@@ -242,6 +274,15 @@ class MainWindow(QMainWindow):
             f"[{self._current_index + 1}/{len(self._files)}] {os.path.basename(img.path)}  "
             f"({img.width}×{img.height}, {len(img.channels)} ch){warn}"
         )
+
+    def _on_measured(self, result):
+        if result is None:
+            return
+        dist_px, dist_um = result
+        if dist_um is not None:
+            self.status_label.setText(f"Measured: {dist_um:.2f} µm  ({dist_px:.1f} px)")
+        else:
+            self.status_label.setText(f"Measured: {dist_px:.1f} px  (no pixel calibration in this file)")
 
     def _on_load_failed(self, err: str):
         QMessageBox.critical(self, "Failed to load ND2", err)
@@ -394,7 +435,8 @@ class MainWindow(QMainWindow):
                 if missing:
                     unmatched[fname] = missing
 
-            self.gl.set_image(img, carried_states=self._carried_states)
+            effective = self._effective_carried_states([c.name for c in img.channels])
+            self.gl.set_image(img, carried_states=effective)
             self._carried_states.update({st.name: st for st in self.gl.get_states()})
             out_path = os.path.join(out_dir, f"{os.path.splitext(fname)[0]}_composite{fmt}")
             self._render_and_save(out_path, scale=scale)
@@ -468,3 +510,45 @@ class MainWindow(QMainWindow):
         self._apply_preset_data_to_live(data)
         self._last_preset_path = path
         self.status_label.setText(f"Preset loaded from {path}")
+
+    # ------------------------------------------------------------------
+    # Default LUT (used instead of auto-contrast for channels with no
+    # carried-over value yet, e.g. the first time a channel name is seen)
+    # ------------------------------------------------------------------
+    def set_default_lut(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose default LUT preset", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Failed to load preset", str(e))
+            return
+        self._default_lut_path = path
+        self._default_lut_data = data
+        self._use_default_lut = True
+        self._settings.setValue("default_lut_path", path)
+        self._settings.setValue("use_default_lut", True)
+        self.act_use_default_lut.setEnabled(True)
+        self.act_use_default_lut.setChecked(True)
+        self.status_label.setText(f"Default LUT set to {path}")
+
+    def _toggle_use_default_lut(self, checked: bool):
+        self._use_default_lut = checked
+        self._settings.setValue("use_default_lut", checked)
+
+    def _effective_carried_states(self, channel_names: list[str]) -> dict[str, ChannelState]:
+        """`_carried_states`, plus default-LUT values for any of `channel_names`
+        that have no carried value yet. Session-carried values always win over
+        the default; auto-contrast is still the fallback for channels absent
+        from both."""
+        if not self._use_default_lut or not self._default_lut_data:
+            return self._carried_states
+        missing = [n for n in channel_names if n not in self._carried_states and n in self._default_lut_data]
+        if not missing:
+            return self._carried_states
+        merged = dict(self._carried_states)
+        for name in missing:
+            merged[name] = self._preset_dict_to_states({name: self._default_lut_data[name]})[name]
+        return merged

@@ -70,6 +70,7 @@ class Nd2Image:
     width: int
     height: int
     channels: list[ChannelData]
+    pixel_size_um: float | None = None
 
 
 def _compute_stats(arr: np.ndarray, bins: int = 256):
@@ -92,6 +93,11 @@ def load_nd2(path: str) -> Nd2Image:
         arr = f.asarray()  # dask-backed lazy array materialized here
         sizes = f.sizes
         names = [c.channel.name for c in f.metadata.channels] if f.metadata and f.metadata.channels else None
+        try:
+            voxel = f.voxel_size()
+            pixel_size_um = float(voxel.x) if voxel and voxel.x else None
+        except Exception:
+            pixel_size_um = None
 
     arr = np.asarray(arr)
 
@@ -130,4 +136,4 @@ def load_nd2(path: str) -> Nd2Image:
             )
         )
 
-    return Nd2Image(path=path, width=width, height=height, channels=channels)
+    return Nd2Image(path=path, width=width, height=height, channels=channels, pixel_size_um=pixel_size_um)

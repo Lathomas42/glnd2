@@ -10,10 +10,12 @@ from __future__ import annotations
 import ctypes
 import os
 
+import math
+
 import numpy as np
 from OpenGL import GL as gl
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QMouseEvent, QSurfaceFormat, QWheelEvent
+from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QSurfaceFormat, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 MAX_CHANNELS = 8
@@ -40,6 +42,10 @@ def default_gl_format() -> QSurfaceFormat:
 
 
 class CompositeGLWidget(QOpenGLWidget):
+    # Emits (distance_px, distance_um_or_None) when a two-click measurement
+    # completes, or None when the current measurement is cleared/reset.
+    measured = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFormat(default_gl_format())
@@ -51,11 +57,16 @@ class CompositeGLWidget(QOpenGLWidget):
         self._img_w = 0
         self._img_h = 0
         self._downsampled = False
+        self._downsample_step = 1
+        self._pixel_size_um: float | None = None
 
         self._zoom = 1.0
         self._pan = [0.0, 0.0]
         self._drag_start = None
         self._pan_start = None
+
+        self._measure_mode = False
+        self._measure_points: list[tuple[float, float]] = []
 
         self.setMouseTracking(True)
         self.setMinimumSize(200, 200)
@@ -187,9 +198,13 @@ class CompositeGLWidget(QOpenGLWidget):
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         self._img_w = -(-nd2_image.width // step)
         self._img_h = -(-nd2_image.height // step)
+        self._downsample_step = step
+        self._pixel_size_um = nd2_image.pixel_size_um
         self._zoom = 1.0
         self._pan = [0.0, 0.0]
+        self._measure_points = []
         self.doneCurrent()
+        self.measured.emit(None)
         self.update()
 
     def is_downsampled(self) -> bool:
@@ -211,6 +226,13 @@ class CompositeGLWidget(QOpenGLWidget):
         self._pan = [0.0, 0.0]
         self.update()
 
+    def set_measure_mode(self, on: bool):
+        self._measure_mode = on
+        self._measure_points = []
+        self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        self.measured.emit(None)
+        self.update()
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
@@ -226,6 +248,42 @@ class CompositeGLWidget(QOpenGLWidget):
             sy = self._zoom
             sx = self._zoom * img_aspect / vp_aspect
         return sx, sy
+
+    def _screen_to_image(self, sx: float, sy: float) -> tuple[float, float]:
+        """Map a widget-space point (e.g. a mouse click) to image pixel coordinates."""
+        w, h = self.width(), self.height()
+        scale_x, scale_y = self._compute_scale(w, h)
+        ndc_x = -1.0 + 2.0 * sx / w if w else 0.0
+        ndc_y = 1.0 - 2.0 * sy / h if h else 0.0
+        apos_x = (ndc_x - self._pan[0]) / scale_x if scale_x else 0.0
+        apos_y = (ndc_y - self._pan[1]) / scale_y if scale_y else 0.0
+        u = (apos_x + 1.0) / 2.0
+        v = (1.0 - apos_y) / 2.0
+        return u * self._img_w, v * self._img_h
+
+    def _image_to_screen(self, px: float, py: float) -> tuple[float, float]:
+        """Inverse of `_screen_to_image`, for drawing overlays at the right spot."""
+        w, h = self.width(), self.height()
+        scale_x, scale_y = self._compute_scale(w, h)
+        u = px / self._img_w if self._img_w else 0.0
+        v = py / self._img_h if self._img_h else 0.0
+        apos_x = 2.0 * u - 1.0
+        apos_y = 1.0 - 2.0 * v
+        ndc_x = apos_x * scale_x + self._pan[0]
+        ndc_y = apos_y * scale_y + self._pan[1]
+        sx = (ndc_x + 1.0) / 2.0 * w
+        sy = (1.0 - ndc_y) / 2.0 * h
+        return sx, sy
+
+    def _measure_distance(self) -> tuple[float, float | None]:
+        """Distance between the two current measure points, in pixels and
+        (if the file had calibration metadata) micrometers."""
+        (x1, y1), (x2, y2) = self._measure_points
+        dist_px = math.hypot(x2 - x1, y2 - y1)
+        dist_um = None
+        if self._pixel_size_um:
+            dist_um = dist_px * self._downsample_step * self._pixel_size_um
+        return dist_px, dist_um
 
     def _draw(self, vp_w: int, vp_h: int):
         gl.glUseProgram(self._program)
@@ -324,6 +382,23 @@ class CompositeGLWidget(QOpenGLWidget):
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
+        if self._measure_mode:
+            if event.button() == Qt.LeftButton:
+                img_pt = self._screen_to_image(event.position().x(), event.position().y())
+                if len(self._measure_points) >= 2:
+                    self._measure_points = [img_pt]
+                    self.measured.emit(None)
+                else:
+                    self._measure_points.append(img_pt)
+                    if len(self._measure_points) == 2:
+                        self.measured.emit(self._measure_distance())
+                self.update()
+            elif event.button() == Qt.RightButton:
+                self._measure_points = []
+                self.measured.emit(None)
+                self.update()
+            return
+
         if event.button() == Qt.LeftButton:
             self._drag_start = event.position()
             self._pan_start = tuple(self._pan)
@@ -339,4 +414,31 @@ class CompositeGLWidget(QOpenGLWidget):
         self._drag_start = None
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        self.reset_view()
+        if not self._measure_mode:
+            self.reset_view()
+
+    # ------------------------------------------------------------------
+    # Measurement overlay (drawn with QPainter on top of the GL content)
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._measure_points:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        points = [self._image_to_screen(px, py) for px, py in self._measure_points]
+
+        pen = QPen(QColor(255, 235, 59), 2)
+        painter.setPen(pen)
+        painter.setBrush(QColor(255, 235, 59))
+        for x, y in points:
+            painter.drawEllipse(QPointF(x, y), 4, 4)
+
+        if len(points) == 2:
+            (x1, y1), (x2, y2) = points
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+            dist_px, dist_um = self._measure_distance()
+            label = f"{dist_um:.2f} µm" if dist_um is not None else f"{dist_px:.1f} px"
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.drawText(QPointF((x1 + x2) / 2 + 8, (y1 + y2) / 2 - 8), label)
+        painter.end()
