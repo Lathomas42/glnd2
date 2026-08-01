@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*_composite.png
+*_composite.tif
+lut_preset.json
+.venv/
