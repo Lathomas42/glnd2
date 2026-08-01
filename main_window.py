@@ -10,6 +10,8 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 
 import nd2_loader
 from channel_panel import ChannelPanel
+from export_dialog import ExportDialog
 from gl_widget import ChannelState, CompositeGLWidget
 
 ND2_EXT = ".nd2"
@@ -67,6 +70,7 @@ class MainWindow(QMainWindow):
         self._loader_thread: LoaderThread | None = None
         self._panels: list[ChannelPanel] = []
         self._last_out_dir: str | None = None
+        self._last_preset_path: str | None = None
 
         self._build_ui()
         self._build_actions()
@@ -152,9 +156,10 @@ class MainWindow(QMainWindow):
         tb.addAction(act_save_next)
         tb.addSeparator()
 
-        act_batch = QAction("Batch Export All…", self)
-        act_batch.triggered.connect(self.batch_export_all)
-        tb.addAction(act_batch)
+        act_export = QAction("Export…", self)
+        act_export.setShortcut(QKeySequence("Ctrl+E"))
+        act_export.triggered.connect(self.run_export_dialog)
+        tb.addAction(act_export)
         tb.addSeparator()
 
         act_reset_view = QAction("Reset View", self)
@@ -227,7 +232,11 @@ class MainWindow(QMainWindow):
     def _on_loaded(self, img: nd2_loader.Nd2Image):
         self.gl.set_image(img, carried_states=self._carried_states)
         self._rebuild_panels(img)
-        self._carried_states = {st.name: st for st in self.gl.get_states()}
+        # Merge, don't replace: a file with fewer channels than a previous
+        # one (e.g. a single-channel acquisition mixed into a folder of
+        # 4-channel ones) must not wipe out carried settings for channels
+        # it simply doesn't have.
+        self._carried_states.update({st.name: st for st in self.gl.get_states()})
         warn = "  [downsampled: exceeds GPU max texture size]" if self.gl.is_downsampled() else ""
         self.status_label.setText(
             f"[{self._current_index + 1}/{len(self._files)}] {os.path.basename(img.path)}  "
@@ -272,8 +281,8 @@ class MainWindow(QMainWindow):
         base = os.path.splitext(self._files[self._current_index])[0]
         return os.path.join(self._folder, f"{base}_composite{ext}")
 
-    def _render_and_save(self, out_path: str) -> bool:
-        arr = self.gl.render_to_array()
+    def _render_and_save(self, out_path: str, scale: float = 1.0) -> bool:
+        arr = self.gl.render_to_array(scale=scale)
         if arr is None:
             QMessageBox.warning(self, "Nothing to save", "No image is loaded.")
             return False
@@ -308,23 +317,69 @@ class MainWindow(QMainWindow):
         self.save_composite()
         self.go_next()
 
-    def batch_export_all(self):
+    # ------------------------------------------------------------------
+    # Export dialog (scope, LUT preset, downsample, format, destination)
+    # ------------------------------------------------------------------
+    def run_export_dialog(self):
         if not self._files:
+            QMessageBox.information(self, "No files", "Open a folder first.")
             return
-        fmt, ok = self._choose_batch_format()
-        if not ok:
+        default_dir = self._last_out_dir or self._folder
+        dlg = ExportDialog(default_dir, initial_preset_path=self._last_preset_path, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        opts = dlg.get_options()
+
+        try:
+            os.makedirs(opts.out_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+            return
+        self._last_out_dir = opts.out_dir
+
+        preset_names = None
+        if opts.preset_path:
+            try:
+                with open(opts.preset_path) as f:
+                    data = json.load(f)
+            except Exception as e:
+                QMessageBox.critical(self, "Failed to load preset", str(e))
+                return
+            preset_names = set(data.keys())
+            self._carried_states.update(self._preset_dict_to_states(data))
+            self._apply_preset_data_to_live(data)
+            self._last_preset_path = opts.preset_path
+
+        if not opts.scope_all_files:
+            fname = self._files[self._current_index]
+            if preset_names is not None:
+                live_names = {st.name for st in self.gl.get_states()}
+                missing = live_names - preset_names
+                if missing:
+                    QMessageBox.warning(
+                        self, "Preset channel mismatch",
+                        f"This file has channel(s) not in the preset, using current/default "
+                        f"values instead: {', '.join(sorted(missing))}\n\n"
+                        f"Preset has: {', '.join(sorted(preset_names))}",
+                    )
+            out_path = os.path.join(opts.out_dir, f"{os.path.splitext(fname)[0]}_composite{opts.fmt}")
+            if self._render_and_save(out_path, scale=opts.scale):
+                self.status_label.setText(f"Exported {out_path}")
             return
 
+        self._export_all_files(opts.out_dir, opts.fmt, opts.scale, preset_names=preset_names)
+
+    def _export_all_files(self, out_dir: str, fmt: str, scale: float, preset_names: set[str] | None = None):
         progress = QProgressDialog("Exporting composites…", "Cancel", 0, len(self._files), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
+        unmatched: dict[str, set[str]] = {}
         for i, fname in enumerate(self._files):
             if progress.wasCanceled():
                 break
             progress.setValue(i)
             progress.setLabelText(f"Exporting {fname}")
-            from PySide6.QtWidgets import QApplication
             QApplication.processEvents()
 
             path = os.path.join(self._folder, fname)
@@ -333,29 +388,59 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Skipped", f"Failed to load {fname}: {e}")
                 continue
+
+            if preset_names is not None:
+                missing = {c.name for c in img.channels} - preset_names
+                if missing:
+                    unmatched[fname] = missing
+
             self.gl.set_image(img, carried_states=self._carried_states)
-            self._carried_states = {st.name: st for st in self.gl.get_states()}
-            out_path = os.path.join(self._folder, f"{os.path.splitext(fname)[0]}_composite{fmt}")
-            self._render_and_save(out_path)
+            self._carried_states.update({st.name: st for st in self.gl.get_states()})
+            out_path = os.path.join(out_dir, f"{os.path.splitext(fname)[0]}_composite{fmt}")
+            self._render_and_save(out_path, scale=scale)
 
         progress.setValue(len(self._files))
-        self.status_label.setText("Batch export complete")
+
+        if unmatched:
+            lines = [f"{fname}: {', '.join(sorted(names))}" for fname, names in unmatched.items()]
+            QMessageBox.warning(
+                self, "Preset channel mismatch",
+                "The preset didn't cover every channel in these files (they used "
+                "current/default values instead):\n\n" + "\n".join(lines[:15])
+                + ("\n…" if len(lines) > 15 else ""),
+            )
+
+        self.status_label.setText("Export complete")
         # Reload currently-selected file so the on-screen view matches the list selection.
         if 0 <= self._current_index < len(self._files):
             self._load_file(os.path.join(self._folder, self._files[self._current_index]))
 
-    def _choose_batch_format(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Choose export format (filename ignored, only extension used)",
-            "composite.png", "PNG (*.png);;TIFF (*.tif)"
-        )
-        if not path:
-            return None, False
-        return os.path.splitext(path)[1] or ".png", True
-
     # ------------------------------------------------------------------
     # Presets
     # ------------------------------------------------------------------
+    @staticmethod
+    def _preset_dict_to_states(data: dict) -> dict[str, ChannelState]:
+        return {
+            name: ChannelState(
+                name=name, data_max=65535, color=tuple(vals["color"]),
+                black=vals["black"], white=vals["white"], gamma=vals["gamma"],
+                enabled=vals["enabled"],
+            )
+            for name, vals in data.items()
+        }
+
+    def _apply_preset_data_to_live(self, data: dict):
+        """Push preset values onto the currently loaded channels/panels, if any match by name."""
+        for i, st in enumerate(self.gl.get_states()):
+            if st.name in data:
+                v = data[st.name]
+                self.gl.set_channel_param(i, black=v["black"], white=v["white"],
+                                           gamma=v["gamma"], enabled=v["enabled"],
+                                           color=tuple(v["color"]))
+                if i < len(self._panels):
+                    self._panels[i].set_values(v["black"], v["white"], v["gamma"],
+                                                v["enabled"], tuple(v["color"]))
+
     def save_preset(self):
         if not self._carried_states:
             QMessageBox.information(self, "No data", "Load a file first.")
@@ -370,6 +455,7 @@ class MainWindow(QMainWindow):
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
+        self._last_preset_path = path
         self.status_label.setText(f"Preset saved to {path}")
 
     def load_preset(self):
@@ -378,20 +464,7 @@ class MainWindow(QMainWindow):
             return
         with open(path) as f:
             data = json.load(f)
-        for name, vals in data.items():
-            self._carried_states[name] = ChannelState(
-                name=name, data_max=65535, color=tuple(vals["color"]),
-                black=vals["black"], white=vals["white"], gamma=vals["gamma"],
-                enabled=vals["enabled"],
-            )
-        # apply to currently loaded channels immediately, if any match
-        for i, st in enumerate(self.gl.get_states()):
-            if st.name in data:
-                v = data[st.name]
-                self.gl.set_channel_param(i, black=v["black"], white=v["white"],
-                                           gamma=v["gamma"], enabled=v["enabled"],
-                                           color=tuple(v["color"]))
-                if i < len(self._panels):
-                    self._panels[i].set_values(v["black"], v["white"], v["gamma"],
-                                                v["enabled"], tuple(v["color"]))
+        self._carried_states.update(self._preset_dict_to_states(data))
+        self._apply_preset_data_to_live(data)
+        self._last_preset_path = path
         self.status_label.setText(f"Preset loaded from {path}")

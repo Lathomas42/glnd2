@@ -258,14 +258,19 @@ class CompositeGLWidget(QOpenGLWidget):
             return
         self._draw(self.width(), self.height())
 
-    def render_to_array(self) -> np.ndarray | None:
-        """Render the composite at full source resolution off-screen.
+    def render_to_array(self, scale: float = 1.0) -> np.ndarray | None:
+        """Render the composite off-screen at `scale` * source resolution.
 
-        Returns an (H, W, 3) uint8 RGB numpy array, or None if no image
-        is loaded.
+        `scale=1.0` renders at full native resolution; `scale=0.5` renders
+        directly at half resolution on the GPU (cheaper than rendering full
+        size and shrinking afterwards). Returns an (H, W, 3) uint8 RGB
+        numpy array, or None if no image is loaded.
         """
         if not self._states or not self._img_w or not self._img_h:
             return None
+
+        out_w = max(1, round(self._img_w * scale))
+        out_h = max(1, round(self._img_h * scale))
 
         self.makeCurrent()
         fbo = gl.glGenFramebuffers(1)
@@ -274,7 +279,7 @@ class CompositeGLWidget(QOpenGLWidget):
         color_tex = gl.glGenTextures(1)
         gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
         gl.glTexImage2D(
-            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, self._img_w, self._img_h, 0,
+            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, out_w, out_h, 0,
             gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
         )
         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
@@ -289,13 +294,18 @@ class CompositeGLWidget(QOpenGLWidget):
             self.doneCurrent()
             raise RuntimeError(f"Offscreen framebuffer incomplete: {status}")
 
-        gl.glViewport(0, 0, self._img_w, self._img_h)
+        gl.glViewport(0, 0, out_w, out_h)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-        self._draw(self._img_w, self._img_h)
+        # Export always shows the full image regardless of the interactive
+        # pan/zoom currently on screen.
+        saved_zoom, saved_pan = self._zoom, self._pan
+        self._zoom, self._pan = 1.0, [0.0, 0.0]
+        self._draw(out_w, out_h)
+        self._zoom, self._pan = saved_zoom, saved_pan
         gl.glFinish()
 
-        pixels = gl.glReadPixels(0, 0, self._img_w, self._img_h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
-        arr = np.frombuffer(pixels, dtype=np.uint8).reshape(self._img_h, self._img_w, 3)
+        pixels = gl.glReadPixels(0, 0, out_w, out_h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE)
+        arr = np.frombuffer(pixels, dtype=np.uint8).reshape(out_h, out_w, 3)
         arr = np.flipud(arr).copy()
 
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
