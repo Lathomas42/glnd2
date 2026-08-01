@@ -3,4 +3,5 @@ __pycache__/
 *_composite.png
 *_composite.tif
 lut_preset.json
+palettes/
 .venv/

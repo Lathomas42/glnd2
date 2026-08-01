@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDialog,
     QDockWidget,
     QFileDialog,
@@ -89,6 +90,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 self._default_lut_data = None
                 self._default_lut_path = None
+
+        palette_name = self._settings.value("color_palette", nd2_loader.DEFAULT_PALETTE)
+        if palette_name not in nd2_loader.COLOR_PALETTES:
+            palette_name = nd2_loader.DEFAULT_PALETTE
+        nd2_loader.set_active_palette(palette_name)
 
         self._build_ui()
         self._build_actions()
@@ -237,6 +243,18 @@ class MainWindow(QMainWindow):
         self.act_use_default_lut.setEnabled(self._default_lut_data is not None)
         self.act_use_default_lut.toggled.connect(self._toggle_use_default_lut)
         tb.addAction(self.act_use_default_lut)
+        tb.addSeparator()
+
+        tb.addWidget(QLabel(" Palette: "))
+        self.palette_combo = QComboBox()
+        self.palette_combo.addItems(list(nd2_loader.COLOR_PALETTES.keys()))
+        self.palette_combo.setCurrentText(nd2_loader.get_active_palette())
+        self.palette_combo.currentTextChanged.connect(self._on_palette_changed)
+        tb.addWidget(self.palette_combo)
+
+        act_save_palette = QAction("Save Palette…", self)
+        act_save_palette.triggered.connect(self.save_new_palette)
+        tb.addAction(act_save_palette)
 
     # ------------------------------------------------------------------
     # Folder / file navigation
@@ -326,6 +344,44 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"Measured: {dist_px:.1f} px  (no pixel calibration in this file)")
 
+    def _on_palette_changed(self, name: str):
+        if name not in nd2_loader.COLOR_PALETTES:
+            return
+        nd2_loader.set_active_palette(name)
+        self._settings.setValue("color_palette", name)
+
+        palette = nd2_loader.COLOR_PALETTES[name]
+        for i, st in enumerate(self.gl.get_states()):
+            w = nd2_loader.wavelength_for_channel(st.name)
+            if w is None:
+                continue
+            color = palette[w]
+            self.gl.set_channel_param(i, color=color)
+            if i < len(self._panels):
+                self._panels[i]._set_color(color, emit=False)
+        self._carried_states.update({st.name: st for st in self.gl.get_states()})
+        self.status_label.setText(f"Color palette: {name}")
+
+    def save_new_palette(self):
+        name, ok = QInputDialog.getText(self, "Save Palette", "Palette name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # Start from the currently active palette so every standard channel
+        # has a color, then overlay whatever's actually on screen right now.
+        palette = dict(nd2_loader.COLOR_PALETTES[nd2_loader.get_active_palette()])
+        for st in self.gl.get_states():
+            w = nd2_loader.wavelength_for_channel(st.name)
+            if w is not None:
+                palette[w] = st.color
+
+        nd2_loader.save_custom_palette(name, palette)
+        if self.palette_combo.findText(name) < 0:
+            self.palette_combo.addItem(name)
+        self.palette_combo.setCurrentText(name)
+        self.status_label.setText(f"Saved palette '{name}'")
+
     def _on_measure_toggled(self, checked: bool):
         self.gl.set_measure_mode(checked)
         if checked:
@@ -405,7 +461,7 @@ class MainWindow(QMainWindow):
         states = self.gl.get_states()
         for i, (ch, st) in enumerate(zip(img.channels, states)):
             panel = ChannelPanel(
-                index=i, name=ch.name, data_max=ch.data_max, color=st.color,
+                index=i, name=ch.display_name or ch.name, data_max=ch.data_max, color=st.color,
                 black=st.black, white=st.white, gamma=st.gamma, enabled=st.enabled,
                 default_black=ch.p_low, default_white=ch.p_high,
             )

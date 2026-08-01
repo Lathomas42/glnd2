@@ -461,7 +461,27 @@ class CompositeGLWidget(QOpenGLWidget):
     # ------------------------------------------------------------------
     def wheelEvent(self, event: QWheelEvent):
         factor = 1.0015 ** event.angleDelta().y()
+        if not self._img_w or not self._img_h:
+            self._zoom = max(0.1, min(60.0, self._zoom * factor))
+            self.update()
+            return
+
+        sx, sy = event.position().x(), event.position().y()
+        img_x, img_y = self._screen_to_image(sx, sy)  # point under the cursor, before zoom
+
         self._zoom = max(0.1, min(60.0, self._zoom * factor))
+
+        # Re-pan so that same image point stays under the cursor after
+        # zooming, instead of the view re-centering on the image's middle.
+        w, h = self.width(), self.height()
+        scale_x, scale_y = self._compute_scale(w, h)
+        u, v = img_x / self._img_w, img_y / self._img_h
+        apos_x, apos_y = 2.0 * u - 1.0, 1.0 - 2.0 * v
+        ndc_x = -1.0 + 2.0 * sx / w if w else 0.0
+        ndc_y = 1.0 - 2.0 * sy / h if h else 0.0
+        self._pan[0] = ndc_x - apos_x * scale_x
+        self._pan[1] = ndc_y - apos_y * scale_y
+
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
