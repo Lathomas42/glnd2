@@ -34,36 +34,56 @@ _FALLBACK_PALETTE = [
 
 _WAVELENGTH_RE = re.compile(r"(\d{3,4})\s*nm")
 
-# A standard 4-color immunofluorescence panel: excitation wavelength ->
-# fluorophore display name. Matched within a tolerance so small
-# wavelength-calibration differences between acquisitions still hit.
-_FLUOROPHORE_NAMES: dict[int, str] = {
-    395: "DAPI",
-    470: "Alexa Fluor 488",
-    555: "Alexa Fluor 555",
-    640: "Alexa Fluor 647",
+# Standard fluorophores, keyed by a short canonical id. Channels are matched
+# to one of these either by excitation wavelength (e.g. "640 nm") or by name
+# pattern (e.g. "AF647", "AF647 Prescan", "GFP") -- different microscopes in
+# this lab label channels either way.
+_FLUOROPHORE_DISPLAY_NAMES: dict[str, str] = {
+    "DAPI": "DAPI",
+    "AF488": "Alexa Fluor 488",
+    "AF555": "Alexa Fluor 555",
+    "AF568": "Alexa Fluor 568",
+    "AF647": "Alexa Fluor 647",
+}
+_FLUOROPHORE_WAVELENGTHS: dict[str, int] = {
+    "DAPI": 395,
+    "AF488": 470,
+    "AF555": 555,
+    "AF647": 640,
+    # AF568 has no wavelength-only acquisitions in this lab yet; add one
+    # here if a scope starts labeling it that way.
 }
 _FLUOROPHORE_TOLERANCE_NM = 10
+_FLUOROPHORE_NAME_PATTERNS: dict[str, re.Pattern] = {
+    "DAPI": re.compile(r"\bDAPI\b", re.IGNORECASE),
+    "AF488": re.compile(r"\b(AF\s*488|Alexa\s*Fluor\s*488|GFP)\b", re.IGNORECASE),
+    "AF555": re.compile(r"\b(AF\s*555|Alexa\s*Fluor\s*555)\b", re.IGNORECASE),
+    "AF568": re.compile(r"\b(AF\s*568|Alexa\s*Fluor\s*568)\b", re.IGNORECASE),
+    "AF647": re.compile(r"\b(AF\s*647|Alexa\s*Fluor\s*647)\b", re.IGNORECASE),
+}
 
 # Named, switchable color palettes for the standard panel above.
-COLOR_PALETTES: dict[str, dict[int, tuple[float, float, float]]] = {
+COLOR_PALETTES: dict[str, dict[str, tuple[float, float, float]]] = {
     "Classic": {
-        395: (0.20, 0.40, 1.00),   # blue
-        470: (0.10, 0.95, 0.20),   # green
-        555: (1.00, 0.75, 0.00),   # yellow/orange
-        640: (1.00, 0.10, 0.10),   # red
+        "DAPI": (0.20, 0.40, 1.00),   # blue
+        "AF488": (0.10, 0.95, 0.20),  # green
+        "AF555": (1.00, 0.75, 0.00),  # yellow/orange
+        "AF568": (1.00, 0.45, 0.05),  # orange
+        "AF647": (1.00, 0.10, 0.10),  # red
     },
     "Vivid": {
-        395: (0.10, 0.15, 0.95),   # deep blue
-        470: (0.05, 1.00, 0.10),   # bright green
-        555: (1.00, 0.05, 0.05),   # red
-        640: (1.00, 0.15, 0.60),   # bright pink
+        "DAPI": (0.10, 0.15, 0.95),   # deep blue
+        "AF488": (0.05, 1.00, 0.10),  # bright green
+        "AF555": (1.00, 0.05, 0.05),  # red
+        "AF568": (1.00, 0.45, 0.00),  # vivid orange
+        "AF647": (1.00, 0.15, 0.60),  # bright pink
     },
     "High Contrast": {
-        395: (0.10, 0.85, 1.00),   # cyan
-        470: (1.00, 0.90, 0.10),   # yellow
-        555: (1.00, 0.50, 0.05),   # orange
-        640: (0.90, 0.10, 0.90),   # magenta
+        "DAPI": (0.10, 0.85, 1.00),   # cyan
+        "AF488": (1.00, 0.90, 0.10),  # yellow
+        "AF555": (1.00, 0.50, 0.05),  # orange
+        "AF568": (0.60, 0.30, 1.00),  # violet
+        "AF647": (0.90, 0.10, 0.90),  # magenta
     },
 }
 DEFAULT_PALETTE = "Vivid"
@@ -84,20 +104,58 @@ def get_active_palette() -> str:
     return _active_palette
 
 
+def _wavelength_to_key(wavelength_str: str) -> str | None:
+    """Migrate an old-format palette key (raw excitation wavelength, e.g.
+    "395") to the current canonical fluorophore key (e.g. "DAPI")."""
+    try:
+        nm = int(wavelength_str)
+    except ValueError:
+        return None
+    for key, w in _FLUOROPHORE_WAVELENGTHS.items():
+        if w == nm:
+            return key
+    return None
+
+
 def load_custom_palettes():
-    """Load any user-saved palettes from disk into COLOR_PALETTES."""
+    """Load any user-saved palettes from disk into COLOR_PALETTES.
+
+    Transparently migrates palettes saved before channels were matched by
+    name as well as wavelength (when keys were raw wavelengths like "395"
+    instead of "DAPI").
+    """
     if not os.path.exists(_CUSTOM_PALETTES_FILE):
         return
     try:
         with open(_CUSTOM_PALETTES_FILE) as f:
             data = json.load(f)
-        for name, wavelengths in data.items():
-            COLOR_PALETTES[name] = {int(w): tuple(c) for w, c in wavelengths.items()}
     except Exception:
-        pass
+        return
+
+    migrated = False
+    for name, entries in data.items():
+        palette = {}
+        for raw_key, color in entries.items():
+            key = raw_key if raw_key in _FLUOROPHORE_DISPLAY_NAMES else _wavelength_to_key(raw_key)
+            if key is None:
+                continue
+            if key != raw_key:
+                migrated = True
+            palette[key] = tuple(color)
+        COLOR_PALETTES[name] = palette
+
+    if migrated:
+        for name in data:
+            if name in COLOR_PALETTES:
+                data[name] = {k: list(c) for k, c in COLOR_PALETTES[name].items()}
+        try:
+            with open(_CUSTOM_PALETTES_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
 
-def save_custom_palette(name: str, palette: dict[int, tuple[float, float, float]]):
+def save_custom_palette(name: str, palette: dict[str, tuple[float, float, float]]):
     """Save (or overwrite) a named palette to disk and register it in COLOR_PALETTES."""
     os.makedirs(_PALETTES_DIR, exist_ok=True)
     existing = {}
@@ -107,7 +165,7 @@ def save_custom_palette(name: str, palette: dict[int, tuple[float, float, float]
                 existing = json.load(f)
         except Exception:
             existing = {}
-    existing[name] = {str(w): list(c) for w, c in palette.items()}
+    existing[name] = {k: list(c) for k, c in palette.items()}
     with open(_CUSTOM_PALETTES_FILE, "w") as f:
         json.dump(existing, f, indent=2)
     COLOR_PALETTES[name] = dict(palette)
@@ -116,15 +174,20 @@ def save_custom_palette(name: str, palette: dict[int, tuple[float, float, float]
 load_custom_palettes()
 
 
-def wavelength_for_channel(name: str) -> int | None:
-    """The matched standard wavelength (395/470/555/640) for a channel name,
-    or None if it doesn't correspond to one of the standard fluorophores."""
+def fluorophore_key_for_channel(name: str) -> str | None:
+    """Canonical fluorophore key (e.g. "AF647") for a channel name, matched
+    either by name pattern ("AF647 Prescan", "GFP") or, failing that, by
+    excitation wavelength ("640 nm"). None if neither matches."""
+    for key, pattern in _FLUOROPHORE_NAME_PATTERNS.items():
+        if pattern.search(name):
+            return key
     m = _WAVELENGTH_RE.search(name)
-    if not m:
-        return None
-    nm = float(m.group(1))
-    best = min(_FLUOROPHORE_NAMES, key=lambda w: abs(w - nm))
-    return best if abs(best - nm) <= _FLUOROPHORE_TOLERANCE_NM else None
+    if m:
+        nm = float(m.group(1))
+        best = min(_FLUOROPHORE_WAVELENGTHS, key=lambda k: abs(_FLUOROPHORE_WAVELENGTHS[k] - nm))
+        if abs(_FLUOROPHORE_WAVELENGTHS[best] - nm) <= _FLUOROPHORE_TOLERANCE_NM:
+            return best
+    return None
 
 
 def _color_for_wavelength(nm: float) -> tuple[float, float, float]:
@@ -140,9 +203,12 @@ def _color_for_wavelength(nm: float) -> tuple[float, float, float]:
 
 
 def default_color_for_channel(name: str, index: int) -> tuple[float, float, float]:
-    w = wavelength_for_channel(name)
-    if w is not None:
-        return COLOR_PALETTES[_active_palette][w]
+    key = fluorophore_key_for_channel(name)
+    if key is not None:
+        # A custom or older palette may not have every standard key (e.g. one
+        # saved before AF568 was added); fall back to the default palette.
+        active = COLOR_PALETTES[_active_palette]
+        return active.get(key) or COLOR_PALETTES[DEFAULT_PALETTE][key]
     m = _WAVELENGTH_RE.search(name)
     if m:
         return _color_for_wavelength(float(m.group(1)))
@@ -156,8 +222,8 @@ def display_name_for_channel(name: str) -> str:
     preset/carry-over key) stays the raw ND2 metadata name so existing
     presets keep matching.
     """
-    w = wavelength_for_channel(name)
-    return _FLUOROPHORE_NAMES[w] if w is not None else name
+    key = fluorophore_key_for_channel(name)
+    return _FLUOROPHORE_DISPLAY_NAMES[key] if key is not None else name
 
 
 @dataclass

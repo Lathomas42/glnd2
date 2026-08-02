@@ -185,7 +185,7 @@ class MainWindow(QMainWindow):
         tb.addAction(act_next)
         tb.addSeparator()
 
-        act_save = QAction("Save Composite", self)
+        act_save = QAction("Save", self)
         act_save.setShortcut(QKeySequence("Ctrl+S"))
         act_save.triggered.connect(self.save_composite)
         tb.addAction(act_save)
@@ -194,11 +194,6 @@ class MainWindow(QMainWindow):
         act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
         act_save_as.triggered.connect(self.save_composite_as)
         tb.addAction(act_save_as)
-
-        act_save_next = QAction("Save && Next", self)
-        act_save_next.setShortcut(QKeySequence("Ctrl+Return"))
-        act_save_next.triggered.connect(self.save_and_next)
-        tb.addAction(act_save_next)
         tb.addSeparator()
 
         act_export = QAction("Export…", self)
@@ -351,11 +346,12 @@ class MainWindow(QMainWindow):
         self._settings.setValue("color_palette", name)
 
         palette = nd2_loader.COLOR_PALETTES[name]
+        default_palette = nd2_loader.COLOR_PALETTES[nd2_loader.DEFAULT_PALETTE]
         for i, st in enumerate(self.gl.get_states()):
-            w = nd2_loader.wavelength_for_channel(st.name)
+            w = nd2_loader.fluorophore_key_for_channel(st.name)
             if w is None:
                 continue
-            color = palette[w]
+            color = palette.get(w) or default_palette[w]
             self.gl.set_channel_param(i, color=color)
             if i < len(self._panels):
                 self._panels[i]._set_color(color, emit=False)
@@ -372,7 +368,7 @@ class MainWindow(QMainWindow):
         # has a color, then overlay whatever's actually on screen right now.
         palette = dict(nd2_loader.COLOR_PALETTES[nd2_loader.get_active_palette()])
         for st in self.gl.get_states():
-            w = nd2_loader.wavelength_for_channel(st.name)
+            w = nd2_loader.fluorophore_key_for_channel(st.name)
             if w is not None:
                 palette[w] = st.color
 
@@ -534,10 +530,6 @@ class MainWindow(QMainWindow):
         )
         if path and self._render_and_save(path):
             self.status_label.setText(f"Saved {path}")
-
-    def save_and_next(self):
-        self.save_composite()
-        self.go_next()
 
     # ------------------------------------------------------------------
     # Export dialog (scope, LUT preset, downsample, format, destination)
