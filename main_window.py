@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import file_lut_store
 import nd2_loader
 import roi_store
 from channel_panel import ChannelPanel
@@ -78,6 +79,8 @@ class MainWindow(QMainWindow):
 
         self._rois: list[roi_store.ROI] = []
         self._pending_center_roi: roi_store.ROI | None = None
+
+        self._overridden_stems: set[str] = set()
 
         self._settings = QSettings("glnd2", "glnd2")
         self._default_lut_path: str | None = self._settings.value("default_lut_path", None)
@@ -187,13 +190,9 @@ class MainWindow(QMainWindow):
 
         act_save = QAction("Save", self)
         act_save.setShortcut(QKeySequence("Ctrl+S"))
-        act_save.triggered.connect(self.save_composite)
+        act_save.setToolTip("Save this file's channel LUT settings (not an image) as its override")
+        act_save.triggered.connect(self.save_file_lut)
         tb.addAction(act_save)
-
-        act_save_as = QAction("Save As…", self)
-        act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        act_save_as.triggered.connect(self.save_composite_as)
-        tb.addAction(act_save_as)
         tb.addSeparator()
 
         act_export = QAction("Export…", self)
@@ -270,13 +269,24 @@ class MainWindow(QMainWindow):
         self._carried_states = {}
         self._rois = roi_store.load_rois(folder)
         self._pending_center_roi = None
+        self._overridden_stems = file_lut_store.list_overridden_stems(folder)
         self._refresh_roi_list()
         self.file_list.blockSignals(True)
         self.file_list.clear()
         for f in files:
-            self.file_list.addItem(QListWidgetItem(f))
+            self.file_list.addItem(QListWidgetItem(self._file_list_label(f)))
         self.file_list.blockSignals(False)
         self.file_list.setCurrentRow(0)
+
+    def _file_list_label(self, fname: str) -> str:
+        stem = os.path.splitext(fname)[0]
+        return f"● {fname}" if stem in self._overridden_stems else fname
+
+    def _refresh_file_list_labels(self):
+        for row, fname in enumerate(self._files):
+            item = self.file_list.item(row)
+            if item is not None:
+                item.setText(self._file_list_label(fname))
 
     def _on_row_selected(self, row: int):
         if row < 0 or row >= len(self._files):
@@ -310,6 +320,10 @@ class MainWindow(QMainWindow):
 
     def _on_loaded(self, img: nd2_loader.Nd2Image):
         effective = self._effective_carried_states([c.name for c in img.channels])
+        override_data = file_lut_store.load_override(self._folder, os.path.basename(img.path))
+        if override_data:
+            effective = dict(effective)
+            effective.update(self._preset_dict_to_states(override_data))
         self.gl.set_image(img, carried_states=effective)
         self._rebuild_panels(img)
         # Merge, don't replace: a file with fewer channels than a previous
@@ -476,12 +490,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Saving
     # ------------------------------------------------------------------
-    def _default_out_path(self, ext=".png") -> str | None:
-        if not (0 <= self._current_index < len(self._files)):
-            return None
-        base = os.path.splitext(self._files[self._current_index])[0]
-        return os.path.join(self._folder, f"{base}_composite{ext}")
-
     def _save_array(self, arr: np.ndarray, out_path: str) -> bool:
         try:
             if out_path.lower().endswith((".tif", ".tiff")):
@@ -516,20 +524,23 @@ class MainWindow(QMainWindow):
                 count += 1
         return count
 
-    def save_composite(self):
-        out_path = self._default_out_path(".png")
-        if not out_path:
+    def save_file_lut(self):
+        """Save the current file's live channel LUT settings as its
+        per-file override, so returning to this file later (or exporting
+        it) automatically uses these settings instead of the standard
+        carried/default-LUT/auto-contrast values."""
+        if not (0 <= self._current_index < len(self._files)):
             return
-        if self._render_and_save(out_path):
-            self.status_label.setText(f"Saved {out_path}")
-
-    def save_composite_as(self):
-        default = self._default_out_path(".png") or ""
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save composite as", default, "PNG (*.png);;TIFF (*.tif)"
-        )
-        if path and self._render_and_save(path):
-            self.status_label.setText(f"Saved {path}")
+        fname = self._files[self._current_index]
+        data = {
+            st.name: dict(black=st.black, white=st.white, gamma=st.gamma,
+                          enabled=st.enabled, color=list(st.color))
+            for st in self.gl.get_states()
+        }
+        file_lut_store.save_override(self._folder, fname, data)
+        self._overridden_stems.add(os.path.splitext(fname)[0])
+        self._refresh_file_list_labels()
+        self.status_label.setText(f"Saved LUT override for {fname}")
 
     # ------------------------------------------------------------------
     # Export dialog (scope, LUT preset, downsample, format, destination)
