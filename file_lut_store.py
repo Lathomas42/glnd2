@@ -20,10 +20,6 @@ def lut_path(folder: str, nd2_filename: str) -> str:
     return os.path.join(luts_dir(folder), _lut_filename(nd2_filename))
 
 
-def has_override(folder: str, nd2_filename: str) -> bool:
-    return os.path.exists(lut_path(folder, nd2_filename))
-
-
 def load_override(folder: str, nd2_filename: str) -> dict | None:
     path = lut_path(folder, nd2_filename)
     if not os.path.exists(path):

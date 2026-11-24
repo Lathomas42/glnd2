@@ -18,8 +18,9 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSpinBox,
     QVBoxLayout,
-    QWidget,
 )
+
+_NO_PRESET_TEXT = "None: each file as it looks when browsed to"
 
 _DOWNSAMPLE_PRESETS = [
     ("Full resolution", 1.0),
@@ -41,10 +42,10 @@ class ExportOptions:
 
 
 class ExportDialog(QDialog):
-    def __init__(self, default_dir: str, initial_preset_path: str | None = None, parent=None):
+    def __init__(self, default_dir: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export Composite")
-        self._preset_path: str | None = initial_preset_path
+        self.setWindowTitle("Export")
+        self._preset_path: str | None = None
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -63,8 +64,11 @@ class ExportDialog(QDialog):
 
         # LUT preset
         preset_row = QHBoxLayout()
-        self.preset_label = QLabel("Use current on-screen settings")
+        self.preset_label = QLabel(_NO_PRESET_TEXT)
         self.preset_label.setStyleSheet("color: palette(mid);")
+        self.preset_label.setToolTip(
+            "Optionally apply a preset instead of the Default LUT / auto-contrast.\n"
+            "Files with their own saved LUTs (●) always keep them.")
         preset_btn = QPushButton("Choose Preset…")
         preset_btn.clicked.connect(self._choose_preset)
         clear_btn = QPushButton("Clear")
@@ -110,25 +114,19 @@ class ExportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        if self._preset_path:
-            self._set_preset_label(self._preset_path)
-
     def _on_downsample_changed(self, idx: int):
         self.custom_spin.setEnabled(_DOWNSAMPLE_PRESETS[idx][1] is None)
-
-    def _set_preset_label(self, path: str):
-        self.preset_label.setText(os.path.basename(path))
-        self.preset_label.setStyleSheet("")
 
     def _choose_preset(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose LUT preset", "", "JSON (*.json)")
         if path:
             self._preset_path = path
-            self._set_preset_label(path)
+            self.preset_label.setText(os.path.basename(path))
+            self.preset_label.setStyleSheet("")
 
     def _clear_preset(self):
         self._preset_path = None
-        self.preset_label.setText("Use current on-screen settings")
+        self.preset_label.setText(_NO_PRESET_TEXT)
         self.preset_label.setStyleSheet("color: palette(mid);")
 
     def _choose_out_dir(self):

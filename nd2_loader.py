@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -49,9 +50,8 @@ _FLUOROPHORE_WAVELENGTHS: dict[str, int] = {
     "DAPI": 395,
     "AF488": 470,
     "AF555": 555,
+    "AF568": 561,
     "AF647": 640,
-    # AF568 has no wavelength-only acquisitions in this lab yet; add one
-    # here if a scope starts labeling it that way.
 }
 _FLUOROPHORE_TOLERANCE_NM = 10
 _FLUOROPHORE_NAME_PATTERNS: dict[str, re.Pattern] = {
@@ -226,17 +226,95 @@ def display_name_for_channel(name: str) -> str:
     return _FLUOROPHORE_DISPLAY_NAMES[key] if key is not None else name
 
 
+@dataclass(frozen=True)
+class ChannelStats:
+    """Intensity statistics used for auto-contrast and the LUT controls.
+
+    Computed over non-zero pixels only: stitched mosaics pad unscanned tiles
+    with exact zeros, which would otherwise dominate the low end.
+    """
+    background: float  # peak of the histogram: camera offset + slide/tissue background
+    noise: float  # robust sigma of that background peak
+    p98: float
+    display_max: float  # upper end of the useful range, ignoring hot pixels
+
+
+# Auto-contrast puts black just above the background peak (so background is
+# inky black) and white `headroom` times further out than the 98th
+# percentile is (so the image is mostly dark, with a few bright pixels and
+# almost nothing saturated). `headroom` is adjustable at runtime.
+AUTO_BLACK_SIGMAS = 2.0
+DEFAULT_AUTO_HEADROOM = 6.0
+# Never stretch less than this many noise sigmas, or a near-empty image
+# would blow its background noise up into bright speckle.
+_MIN_RANGE_SIGMAS = 25.0
+_STATS_SAMPLES = 1_000_000
+_HIST_BINS = 256
+
+
+def auto_levels(stats: ChannelStats, headroom: float = DEFAULT_AUTO_HEADROOM) -> tuple[float, float]:
+    """(black, white) auto-contrast levels for a channel."""
+    black = stats.background + AUTO_BLACK_SIGMAS * stats.noise
+    span = max(headroom * (stats.p98 - black), _MIN_RANGE_SIGMAS * stats.noise, 1.0)
+    white = min(black + span, 65535.0)
+    black = min(black, white - 1.0)
+    return float(black), float(white)
+
+
+def _compute_stats(plane: np.ndarray) -> tuple[ChannelStats, np.ndarray]:
+    """Stats plus a `_HIST_BINS`-bin histogram over [0, display_max].
+
+    Everything is derived from one exact per-intensity count of a ~1M pixel
+    sample (the data is 16-bit), which is ~10x faster than float
+    percentiles/histograms on the same sample.
+    """
+    stride = max(1, int(np.sqrt(plane.size / _STATS_SAMPLES)))
+    counts = np.bincount(plane[::stride, ::stride].ravel(), minlength=65536)
+    counts[0] = 0  # stitch padding, not signal
+    cdf = np.cumsum(counts)
+    total = int(cdf[-1])
+    if total == 0:
+        return ChannelStats(0.0, 0.0, 1.0, 1.0), np.zeros(_HIST_BINS, dtype=np.int64)
+
+    def pct(q: float) -> int:
+        return int(np.searchsorted(cdf, q / 100.0 * total))
+
+    lo, q25, hi = pct(0.1), pct(25), pct(90)
+
+    # Background = the dominant low-intensity peak. Smooth over a window
+    # matched to the peak's width before taking the argmax, so noise in
+    # individual intensity counts doesn't pick a spurious maximum.
+    width = max(5, int(round(5 * max(1.0, (q25 - lo) / 50.0))))
+    smooth = np.convolve(counts[lo:hi + 1].astype(np.float64), np.ones(width), mode="same")
+    mode = lo + int(np.argmax(smooth))
+
+    # The left flank of the peak is pure noise (signal only adds intensity),
+    # so its spread is a clean estimate of background noise: the median
+    # distance below the mode, as a robust sigma.
+    below = counts[1:mode][::-1]  # distance 1, 2, ... below the mode
+    noise = 0.0
+    if below.sum() > 0:
+        noise = 1.4826 * (int(np.searchsorted(np.cumsum(below), below.sum() / 2.0)) + 1)
+
+    p98, p9999 = pct(98), pct(99.99)
+    partial = ChannelStats(float(mode), noise, float(p98), 1.0)
+    display_max = float(min(max(p9999, auto_levels(partial)[1], 1.0), 65535.0))
+    stats = ChannelStats(float(mode), noise, float(p98), display_max)
+
+    top = int(display_max)
+    bins = (np.arange(top + 1) * _HIST_BINS // (top + 1)).astype(np.int64)
+    hist = np.bincount(bins, weights=counts[:top + 1], minlength=_HIST_BINS).astype(np.int64)
+    return stats, hist
+
+
 @dataclass
 class ChannelData:
-    name: str
-    array: np.ndarray  # 2D uint16
-    data_max: int  # actual max pixel value observed (for slider range)
-    default_color: tuple[float, float, float]
-    hist_counts: np.ndarray = field(repr=False)
-    hist_max_bin: int
-    p_low: float  # suggested auto-contrast black point
-    p_high: float  # suggested auto-contrast white point
-    display_name: str = ""  # human-readable label, e.g. "Alexa Fluor 647"
+    name: str  # raw ND2 channel name: the channel's identity for LUT presets/overrides
+    display_name: str  # human-readable label, e.g. "Alexa Fluor 647"
+    # 2D uint16 (possibly a strided view into Nd2Image.packed); None once on the GPU.
+    array: np.ndarray | None = field(repr=False)
+    stats: ChannelStats
+    hist_counts: np.ndarray = field(repr=False)  # over [0, stats.display_max]
 
 
 @dataclass
@@ -246,70 +324,79 @@ class Nd2Image:
     height: int
     channels: list[ChannelData]
     pixel_size_um: float | None = None
+    # ND2 stores channels interleaved per pixel. When that buffer is a plain
+    # contiguous (Y, X, C) array with C <= 4 it is uploaded to the GPU as-is,
+    # as one multi-component texture, instead of channel by channel.
+    packed: np.ndarray | None = field(default=None, repr=False)
+    # gl_widget.GpuTextures when a loader thread already put the pixels on the
+    # GPU; whoever displays (or discards) the image takes ownership.
+    gpu: object | None = None
 
 
-def _compute_stats(arr: np.ndarray, bins: int = 256):
-    """Downsampled histogram + percentile auto-contrast suggestion."""
-    step_y = max(1, arr.shape[0] // 512)
-    step_x = max(1, arr.shape[1] // 512)
-    sample = arr[::step_y, ::step_x]
-    data_max = int(arr.max()) if arr.size else 1
-    hi = max(data_max, 1)
-    counts, _ = np.histogram(sample, bins=bins, range=(0, hi))
-    p_low, p_high = np.percentile(sample, [0.5, 99.7])
-    if p_high <= p_low:
-        p_high = p_low + 1
-    return data_max, counts, int(counts.max() if counts.size else 1), float(p_low), float(p_high)
+def _to_cyx(arr: np.ndarray, axes: list[str]) -> np.ndarray:
+    """Reduce an ND2 array to (C, Y, X).
+
+    Z stacks are max-projected; any other extra axis (time, stage position)
+    contributes its first plane. RGB samples are treated as channels when
+    the file has no explicit channel axis.
+    """
+    axes = list(axes)
+    if "C" not in axes and "S" in axes:
+        axes[axes.index("S")] = "C"
+    for ax in [a for a in axes if a not in ("C", "Y", "X")]:
+        i = axes.index(ax)
+        arr = arr.max(axis=i) if ax == "Z" else np.take(arr, 0, axis=i)
+        axes.pop(i)
+    if "C" not in axes:
+        arr = arr[np.newaxis]
+        axes.insert(0, "C")
+    return arr.transpose([axes.index(a) for a in ("C", "Y", "X")])
+
+
+MAX_PACKED_CHANNELS = 4  # an RGBA texture holds at most four
+
+
+def _prepare_channel(name: str, plane: np.ndarray, copy: bool) -> ChannelData:
+    if copy:  # de-interleave into its own contiguous buffer
+        plane = np.ascontiguousarray(plane, dtype=np.uint16)
+    stats, counts = _compute_stats(plane)
+    return ChannelData(
+        name=name,
+        display_name=display_name_for_channel(name),
+        array=plane,
+        stats=stats,
+        hist_counts=counts,
+    )
 
 
 def load_nd2(path: str) -> Nd2Image:
-    """Load an ND2 file and split it into per-channel 2D arrays with stats."""
+    """Load an ND2 file into per-channel 2D arrays with stats."""
     with nd2.ND2File(path) as f:
-        arr = f.asarray()  # dask-backed lazy array materialized here
-        sizes = f.sizes
-        names = [c.channel.name for c in f.metadata.channels] if f.metadata and f.metadata.channels else None
+        arr = np.asarray(f.asarray())
+        axes = list(f.sizes.keys())
+        metadata_channels = f.metadata.channels if f.metadata and f.metadata.channels else []
+        names = [c.channel.name for c in metadata_channels]
         try:
             voxel = f.voxel_size()
             pixel_size_um = float(voxel.x) if voxel and voxel.x else None
         except Exception:
             pixel_size_um = None
 
-    arr = np.asarray(arr)
-
-    if "C" in sizes:
-        c_axis = list(sizes.keys()).index("C")
-        n_channels = sizes["C"]
-        arr = np.moveaxis(arr, c_axis, 0)
-        # Collapse any remaining leading dims (e.g. multi-position/time) by
-        # taking the first plane; ND2s from a single acquisition are (C,Y,X).
-        while arr.ndim > 3:
-            arr = arr[0]
-    else:
-        n_channels = 1
-        arr = arr[np.newaxis, ...]
-
-    height, width = arr.shape[-2], arr.shape[-1]
-    if names is None or len(names) != n_channels:
+    arr = _to_cyx(arr, axes)
+    n_channels, height, width = arr.shape
+    if len(names) != n_channels:
         names = [f"Ch{i + 1}" for i in range(n_channels)]
 
-    channels = []
-    for i in range(n_channels):
-        plane = np.ascontiguousarray(arr[i])
-        if plane.dtype != np.uint16:
-            plane = plane.astype(np.uint16)
-        data_max, counts, hist_max_bin, p_low, p_high = _compute_stats(plane)
-        channels.append(
-            ChannelData(
-                name=names[i],
-                array=plane,
-                data_max=data_max,
-                default_color=default_color_for_channel(names[i], i),
-                hist_counts=counts,
-                hist_max_bin=hist_max_bin,
-                p_low=p_low,
-                p_high=p_high,
-                display_name=display_name_for_channel(names[i]),
-            )
-        )
+    interleaved = arr.transpose(1, 2, 0)  # (Y, X, C)
+    packed = None
+    if (n_channels <= MAX_PACKED_CHANNELS and interleaved.dtype == np.uint16
+            and interleaved.flags.c_contiguous):
+        packed = interleaved  # upload as-is; channels stay strided views into it
 
-    return Nd2Image(path=path, width=width, height=height, channels=channels, pixel_size_um=pixel_size_um)
+    # Per-channel work (copies, stats) releases the GIL, so threads run it in
+    # parallel.
+    with ThreadPoolExecutor(max_workers=min(n_channels, os.cpu_count() or 1)) as pool:
+        channels = list(pool.map(lambda name, plane: _prepare_channel(name, plane, packed is None), names, arr))
+
+    return Nd2Image(path=path, width=width, height=height, channels=channels,
+                    pixel_size_um=pixel_size_um, packed=packed)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -7,13 +8,14 @@ import traceback
 
 import numpy as np
 from PySide6.QtCore import QSettings, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QOffscreenSurface
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -37,7 +39,7 @@ import nd2_loader
 import roi_store
 from channel_panel import ChannelPanel
 from export_dialog import ExportDialog
-from gl_widget import ChannelState, CompositeGLWidget
+from gl_widget import MAX_CHANNELS, ChannelState, CompositeGLWidget, default_gl_format, upload_in_background
 
 ND2_EXT = ".nd2"
 
@@ -46,52 +48,106 @@ def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
-class LoaderThread(QThread):
-    loaded = Signal(object)
-    failed = Signal(str)
+def _read_json(path: str):
+    with open(path) as f:
+        return json.load(f)
 
-    def __init__(self, path: str):
+
+def _rgb255(color) -> tuple[int, int, int]:
+    return tuple(int(round(c * 255)) for c in color)
+
+
+def _state_to_dict(st: ChannelState) -> dict:
+    return dict(black=st.black, white=st.white, gamma=st.gamma, enabled=st.enabled, color=list(st.color))
+
+
+def _state_from_dict(name: str, vals: dict, default_color) -> ChannelState:
+    """Tolerates presets missing optional keys (hand-edited or older files)."""
+    return ChannelState(
+        name=name,
+        color=tuple(vals.get("color", default_color)),
+        black=float(vals["black"]),
+        white=float(vals["white"]),
+        gamma=float(vals.get("gamma", 1.0)),
+        enabled=bool(vals.get("enabled", True)),
+    )
+
+
+class LoaderThread(QThread):
+    loaded = Signal(object)  # Nd2Image
+    failed = Signal(str, str)  # path, traceback
+
+    def __init__(self, path: str, surface: QOffscreenSurface | None):
         super().__init__()
         self.path = path
+        self.surface = surface
 
     def run(self):
         try:
             img = nd2_loader.load_nd2(self.path)
-            self.loaded.emit(img)
         except Exception:
-            self.failed.emit(traceback.format_exc())
+            self.failed.emit(self.path, traceback.format_exc())
+            return
+        # Upload here too, so showing the image never stalls the UI.
+        upload_in_background(img, self.surface)
+        self.loaded.emit(img)
 
 
 class MainWindow(QMainWindow):
+    """File browser + LUT controls around the GPU compositor.
+
+    Each file's channels are displayed with, in order of precedence: the
+    file's saved per-file LUT (Save); otherwise whatever the same channel
+    looked like on the previous file (levels, gamma, color, visibility carry
+    over as you browse); otherwise the Default LUT, if enabled; otherwise
+    auto-contrast. Saved per-file LUTs never carry over to other files.
+    """
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("glnd2")
         self.resize(1500, 950)
 
-        self._folder = None
+        self._folder: str | None = None
         self._files: list[str] = []
         self._current_index = -1
-        self._carried_states: dict[str, ChannelState] = {}
-        self._loader_thread: LoaderThread | None = None
+        # Channels of the displayed file, minus pixel data (that lives on the GPU).
+        self._channels: list[nd2_loader.ChannelData] = []
+        # Last-seen settings per raw channel name, carried to the next file.
+        self._carried: dict[str, ChannelState] = {}
+        # Channels of the displayed file whose settings came from its saved LUT.
+        self._override_names: set[str] = set()
         self._panels: list[ChannelPanel] = []
-        self._last_out_dir: str | None = None
-        self._last_preset_path: str | None = None
+
+        # The single background loader. Cleared only by its own `finished`
+        # handler, so a new loader never starts (and never replaces this
+        # one's last reference) while it is still running.
+        self._loader: LoaderThread | None = None
+        self._unreadable: set[str] = set()  # paths that failed; not read ahead again
+        self._want_row: int | None = None  # row requested but not yet shown
+        self._prefetched: nd2_loader.Nd2Image | None = None
+        self._export_view: CompositeGLWidget | None = None  # hidden, for batch export
 
         self._rois: list[roi_store.ROI] = []
         self._pending_center_roi: roi_store.ROI | None = None
-
         self._overridden_stems: set[str] = set()
+        self._last_out_dir: str | None = None
+
+        # Surface for the loader thread's GL context (must be made on this thread).
+        self._upload_surface = QOffscreenSurface()
+        self._upload_surface.setFormat(default_gl_format())
+        self._upload_surface.create()
 
         self._settings = QSettings("glnd2", "glnd2")
+        self._auto_headroom = float(self._settings.value(
+            "auto_headroom", nd2_loader.DEFAULT_AUTO_HEADROOM, type=float))
         self._default_lut_path: str | None = self._settings.value("default_lut_path", None)
         self._use_default_lut: bool = self._settings.value("use_default_lut", False, type=bool)
         self._default_lut_data: dict | None = None
-        if self._default_lut_path and os.path.exists(self._default_lut_path):
+        if self._default_lut_path:
             try:
-                with open(self._default_lut_path) as f:
-                    self._default_lut_data = json.load(f)
+                self._default_lut_data = _read_json(self._default_lut_path)
             except Exception:
-                self._default_lut_data = None
                 self._default_lut_path = None
 
         palette_name = self._settings.value("color_palette", nd2_loader.DEFAULT_PALETTE)
@@ -103,10 +159,11 @@ class MainWindow(QMainWindow):
         self._build_actions()
 
     # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
     def _build_ui(self):
         splitter = QSplitter(Qt.Horizontal)
 
-        # left: file browser
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
@@ -119,30 +176,35 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.file_list, 1)
         splitter.addWidget(left)
 
-        # center: GL composite view
         self.gl = CompositeGLWidget()
         self.gl.measured.connect(self._on_measured)
         self.gl.roiDrawn.connect(self._on_roi_drawn)
         splitter.addWidget(self.gl)
 
-        # right: channel controls
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
-        right_layout.addWidget(QLabel("<b>Channels</b>"))
-        self.panel_scroll = QScrollArea()
-        self.panel_scroll.setWidgetResizable(True)
-        self.panel_container = QWidget()
-        self.panel_layout = QVBoxLayout(self.panel_container)
+        channels_header = QHBoxLayout()
+        channels_header.addWidget(QLabel("<b>Channels</b>"))
+        channels_header.addStretch(1)
+        auto_all_btn = QPushButton("Auto")
+        auto_all_btn.setToolTip("Auto-contrast every channel of this file (see Auto headroom).\n"
+                                "The result carries to the next files like any other setting.")
+        auto_all_btn.clicked.connect(self.auto_all_channels)
+        channels_header.addWidget(auto_all_btn)
+        right_layout.addLayout(channels_header)
+        panel_scroll = QScrollArea()
+        panel_scroll.setWidgetResizable(True)
+        panel_container = QWidget()
+        self.panel_layout = QVBoxLayout(panel_container)
         self.panel_layout.addStretch(1)
-        self.panel_scroll.setWidget(self.panel_container)
-        right_layout.addWidget(self.panel_scroll, 1)
+        panel_scroll.setWidget(panel_container)
+        right_layout.addWidget(panel_scroll, 1)
         splitter.addWidget(right)
 
         splitter.setSizes([260, 950, 380])
         self.setCentralWidget(splitter)
 
-        # ROI dock: browsable list of rectangle ROIs, click to jump to one
         roi_dock = QDockWidget("ROIs", self)
         roi_dock_widget = QWidget()
         roi_dock_layout = QVBoxLayout(roi_dock_widget)
@@ -161,82 +223,67 @@ class MainWindow(QMainWindow):
         roi_dock.setWidget(roi_dock_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, roi_dock)
 
-        self.status = QStatusBar()
-        self.setStatusBar(self.status)
+        status = QStatusBar()
+        self.setStatusBar(status)
         self.status_label = QLabel("No folder opened")
-        self.status.addWidget(self.status_label, 1)
+        status.addWidget(self.status_label, 1)
 
     def _build_actions(self):
         tb = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        act_open = QAction("Open Folder…", self)
-        act_open.setShortcut(QKeySequence("Ctrl+O"))
-        act_open.triggered.connect(self.open_folder)
-        tb.addAction(act_open)
+        def action(text, slot, shortcut=None, tip=None, checkable=False):
+            act = QAction(text, self)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+            if tip:
+                act.setToolTip(tip)
+            act.setCheckable(checkable)
+            (act.toggled if checkable else act.triggered).connect(slot)
+            tb.addAction(act)
+            return act
+
+        action("Open Folder…", self.open_folder, "Ctrl+O")
+        tb.addSeparator()
+        action("◀ Prev", self.go_prev, "Ctrl+Left")
+        action("Next ▶", self.go_next, "Ctrl+Right")
+        tb.addSeparator()
+        action("Save", self.save_file_lut, "Ctrl+S",
+               "Save this file's channel LUTs; it will always open with them (● in the file list)")
+        action("Revert", self.revert_file_lut, None,
+               "Delete this file's saved LUTs and go back to the carried-over settings")
+        tb.addSeparator()
+        action("Export…", self.run_export_dialog, "Ctrl+E")
+        tb.addSeparator()
+        action("Reset View", self.gl.reset_view)
+        self.act_measure = action("Measure", self._on_measure_toggled, "Ctrl+M", checkable=True)
+        self.act_roi = action("Draw ROI", self._on_roi_mode_toggled, "Ctrl+R", checkable=True)
         tb.addSeparator()
 
-        act_prev = QAction("◀ Prev", self)
-        act_prev.setShortcut(QKeySequence("Ctrl+Left"))
-        act_prev.triggered.connect(self.go_prev)
-        tb.addAction(act_prev)
-
-        act_next = QAction("Next ▶", self)
-        act_next.setShortcut(QKeySequence("Ctrl+Right"))
-        act_next.triggered.connect(self.go_next)
-        tb.addAction(act_next)
+        tb.addWidget(QLabel(" Auto headroom: "))
+        self.headroom_spin = QDoubleSpinBox()
+        self.headroom_spin.setRange(1.0, 20.0)
+        self.headroom_spin.setSingleStep(0.5)
+        self.headroom_spin.setDecimals(1)
+        self.headroom_spin.setSuffix("×")
+        self.headroom_spin.setValue(self._auto_headroom)
+        self.headroom_spin.setToolTip(
+            "Auto-contrast white point = black + this × (98th percentile − black).\n"
+            "Higher = darker image, fewer saturated pixels. Used by the Auto\n"
+            "buttons, and applies live to channels currently on auto.")
+        self.headroom_spin.valueChanged.connect(self._on_headroom_changed)
+        tb.addWidget(self.headroom_spin)
         tb.addSeparator()
 
-        act_save = QAction("Save", self)
-        act_save.setShortcut(QKeySequence("Ctrl+S"))
-        act_save.setToolTip("Save this file's channel LUT settings (not an image) as its override")
-        act_save.triggered.connect(self.save_file_lut)
-        tb.addAction(act_save)
+        action("Save Preset…", self.save_preset, tip="Save this file's channel LUTs to a preset file")
+        action("Load Preset…", self.load_preset, tip="Apply a preset file's LUTs to this file")
         tb.addSeparator()
-
-        act_export = QAction("Export…", self)
-        act_export.setShortcut(QKeySequence("Ctrl+E"))
-        act_export.triggered.connect(self.run_export_dialog)
-        tb.addAction(act_export)
-        tb.addSeparator()
-
-        act_reset_view = QAction("Reset View", self)
-        act_reset_view.triggered.connect(self.gl.reset_view)
-        tb.addAction(act_reset_view)
-
-        self.act_measure = QAction("Measure", self)
-        self.act_measure.setCheckable(True)
-        self.act_measure.setShortcut(QKeySequence("Ctrl+M"))
-        self.act_measure.toggled.connect(self._on_measure_toggled)
-        tb.addAction(self.act_measure)
-
-        self.act_roi = QAction("Draw ROI", self)
-        self.act_roi.setCheckable(True)
-        self.act_roi.setShortcut(QKeySequence("Ctrl+R"))
-        self.act_roi.toggled.connect(self._on_roi_mode_toggled)
-        tb.addAction(self.act_roi)
-        tb.addSeparator()
-
-        act_save_preset = QAction("Save Preset…", self)
-        act_save_preset.triggered.connect(self.save_preset)
-        tb.addAction(act_save_preset)
-
-        act_load_preset = QAction("Load Preset…", self)
-        act_load_preset.triggered.connect(self.load_preset)
-        tb.addAction(act_load_preset)
-        tb.addSeparator()
-
-        act_set_default_lut = QAction("Set Default LUT…", self)
-        act_set_default_lut.triggered.connect(self.set_default_lut)
-        tb.addAction(act_set_default_lut)
-
-        self.act_use_default_lut = QAction("Use Default LUT", self)
-        self.act_use_default_lut.setCheckable(True)
+        action("Set Default LUT…", self.set_default_lut,
+               tip="A preset to start from instead of auto-contrast, for channels with nothing to carry over")
+        self.act_use_default_lut = action("Use Default LUT", self._toggle_use_default_lut, checkable=True)
         self.act_use_default_lut.setChecked(self._use_default_lut)
         self.act_use_default_lut.setEnabled(self._default_lut_data is not None)
-        self.act_use_default_lut.toggled.connect(self._toggle_use_default_lut)
-        tb.addAction(self.act_use_default_lut)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Palette: "))
@@ -245,10 +292,7 @@ class MainWindow(QMainWindow):
         self.palette_combo.setCurrentText(nd2_loader.get_active_palette())
         self.palette_combo.currentTextChanged.connect(self._on_palette_changed)
         tb.addWidget(self.palette_combo)
-
-        act_save_palette = QAction("Save Palette…", self)
-        act_save_palette.triggered.connect(self.save_new_palette)
-        tb.addAction(act_save_palette)
+        action("Save Palette…", self.save_new_palette)
 
     # ------------------------------------------------------------------
     # Folder / file navigation
@@ -257,17 +301,23 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Choose folder with .nd2 files")
         if not folder:
             return
-        files = sorted(
-            (f for f in os.listdir(folder) if f.lower().endswith(ND2_EXT)),
-            key=_natural_key,
-        )
+        files = sorted((f for f in os.listdir(folder) if f.lower().endswith(ND2_EXT)), key=_natural_key)
         if not files:
             QMessageBox.warning(self, "No files", "No .nd2 files found in that folder.")
             return
+        try:
+            rois = roi_store.load_rois(folder)
+        except Exception as e:
+            QMessageBox.warning(self, "ROIs not loaded",
+                                f"Couldn't read {roi_store.rois_path(folder)}; starting with no ROIs.\n\n{e}")
+            rois = []
+
         self._folder = folder
         self._files = files
-        self._carried_states = {}
-        self._rois = roi_store.load_rois(folder)
+        self._current_index = -1
+        self._want_row = None
+        self._set_prefetched(None)
+        self._rois = rois
         self._pending_center_roi = None
         self._overridden_stems = file_lut_store.list_overridden_stems(folder)
         self._refresh_roi_list()
@@ -279,8 +329,7 @@ class MainWindow(QMainWindow):
         self.file_list.setCurrentRow(0)
 
     def _file_list_label(self, fname: str) -> str:
-        stem = os.path.splitext(fname)[0]
-        return f"● {fname}" if stem in self._overridden_stems else fname
+        return f"● {fname}" if os.path.splitext(fname)[0] in self._overridden_stems else fname
 
     def _refresh_file_list_labels(self):
         for row, fname in enumerate(self._files):
@@ -288,62 +337,277 @@ class MainWindow(QMainWindow):
             if item is not None:
                 item.setText(self._file_list_label(fname))
 
+    def _current_file(self) -> str | None:
+        if 0 <= self._current_index < len(self._files):
+            return self._files[self._current_index]
+        return None
+
+    def _path(self, row: int) -> str:
+        return os.path.join(self._folder, self._files[row])
+
     def _on_row_selected(self, row: int):
-        if row < 0 or row >= len(self._files):
-            return
-        self._current_index = row
-        path = os.path.join(self._folder, self._files[row])
-        self._load_file(path)
+        if 0 <= row < len(self._files):
+            self._request_load(row)
 
     def go_prev(self):
-        if self._current_index > 0:
-            self.file_list.setCurrentRow(self._current_index - 1)
+        row = self.file_list.currentRow()
+        if row > 0:
+            self.file_list.setCurrentRow(row - 1)
 
     def go_next(self):
-        if self._current_index < len(self._files) - 1:
-            self.file_list.setCurrentRow(self._current_index + 1)
+        row = self.file_list.currentRow()
+        if row < len(self._files) - 1:
+            self.file_list.setCurrentRow(row + 1)
 
     # ------------------------------------------------------------------
-    # Loading
+    # Loading: one background loader at a time. After a file is shown, the
+    # next file is read ahead so Next ▶ only has to upload it to the GPU.
     # ------------------------------------------------------------------
-    def _load_file(self, path: str):
-        if self._loader_thread is not None and self._loader_thread.isRunning():
+    def _loader_running(self) -> bool:
+        return self._loader is not None
+
+    def _request_load(self, row: int):
+        self._want_row = row
+        path = self._path(row)
+        self._unreadable.discard(path)  # an explicit request always retries
+        if self._prefetched is not None and self._prefetched.path == path:
+            img, self._prefetched = self._prefetched, None
+            self._display(row, img)
             return
-        self.status_label.setText(f"Loading {os.path.basename(path)}…")
-        self.setEnabled(False)
-        thread = LoaderThread(path)
+        self.status_label.setText(f"Loading {self._files[row]}…")
+        # If a loader (maybe a read-ahead) is busy, it finishes first and
+        # _on_loader_finished then starts the wanted row.
+        if not self._loader_running():
+            self._start_loader(path)
+
+    def _start_loader(self, path: str):
+        thread = LoaderThread(path, self._upload_surface)
         thread.loaded.connect(self._on_loaded)
         thread.failed.connect(self._on_load_failed)
-        thread.finished.connect(lambda: self.setEnabled(True))
-        self._loader_thread = thread
+        thread.finished.connect(self._on_loader_finished)
+        self._loader = thread
         thread.start()
 
     def _on_loaded(self, img: nd2_loader.Nd2Image):
-        effective = self._effective_carried_states([c.name for c in img.channels])
-        override_data = file_lut_store.load_override(self._folder, os.path.basename(img.path))
-        if override_data:
-            effective = dict(effective)
-            effective.update(self._preset_dict_to_states(override_data))
-        self.gl.set_image(img, carried_states=effective)
-        self._rebuild_panels(img)
-        # Merge, don't replace: a file with fewer channels than a previous
-        # one (e.g. a single-channel acquisition mixed into a folder of
-        # 4-channel ones) must not wipe out carried settings for channels
-        # it simply doesn't have.
-        self._carried_states.update({st.name: st for st in self.gl.get_states()})
-        warn = "  [downsampled: exceeds GPU max texture size]" if self.gl.is_downsampled() else ""
+        if os.path.dirname(img.path) != self._folder:
+            self.gl.discard(img)  # from a folder that has since been closed
+        elif self._want_row is not None and self._path(self._want_row) == img.path:
+            self._display(self._want_row, img)
+        else:
+            self._set_prefetched(img)  # read-ahead, or a request since superseded
+
+    def _set_prefetched(self, img: nd2_loader.Nd2Image | None):
+        """Hold at most one not-displayed image, freeing the one it replaces."""
+        if self._prefetched is not None and self._prefetched is not img:
+            self.gl.discard(self._prefetched)
+        self._prefetched = img
+
+    def _on_load_failed(self, path: str, err: str):
+        self._unreadable.add(path)
+        if self._want_row is not None and self._path(self._want_row) == path:
+            self._want_row = None
+            QMessageBox.critical(self, "Failed to load ND2", err)
+            self.status_label.setText("Load failed")
+
+    def _on_loader_finished(self):
+        thread, self._loader = self._loader, None
+        thread.wait()  # returns at once: run() is over, the thread is just winding down
+        if self._folder is None:
+            return
+        if self._want_row is not None:
+            self._start_loader(self._path(self._want_row))
+        else:
+            self._read_ahead()
+
+    def _read_ahead(self):
+        nxt = self._current_index + 1
+        if not (0 <= nxt < len(self._files)) or self._loader_running():
+            return
+        path = self._path(nxt)
+        if path in self._unreadable or (self._prefetched is not None and self._prefetched.path == path):
+            return
+        self._set_prefetched(None)
+        self._start_loader(path)
+
+    def closeEvent(self, event):
+        if self._loader is not None:
+            self._loader.wait()  # a QThread must not be destroyed while running
+        self._set_prefetched(None)
+        super().closeEvent(event)
+
+    def _display(self, row: int, img: nd2_loader.Nd2Image):
+        self._want_row = None
+        self._current_index = row
+        self._show_image(img)
+        self._read_ahead()
+
+    def _show_image(self, img: nd2_loader.Nd2Image):
+        fname = os.path.basename(img.path)
+        overridden = os.path.splitext(fname)[0] in self._overridden_stems
+        self._capture_carry()
+        states, self._override_names = self._resolve_states(img.path, img.channels)
+        self.gl.set_image(img, states)
+        self._channels = [dataclasses.replace(ch, array=None) for ch in img.channels[:MAX_CHANNELS]]
+        self._rebuild_panels()
+
+        notes = []
+        if overridden:
+            notes.append("saved LUT")
+        if self.gl.is_downsampled():
+            notes.append("downsampled: exceeds GPU max texture size")
         self.status_label.setText(
-            f"[{self._current_index + 1}/{len(self._files)}] {os.path.basename(img.path)}  "
-            f"({img.width}×{img.height}, {len(img.channels)} ch){warn}"
+            f"[{self._current_index + 1}/{len(self._files)}] {fname}  "
+            f"({img.width}×{img.height}, {len(img.channels)} ch)"
+            + "".join(f"  [{n}]" for n in notes)
         )
 
-        fname = os.path.basename(img.path)
         self.gl.set_rois([r for r in self._rois if r.file == fname])
-        if self._pending_center_roi is not None and self._pending_center_roi.file == fname:
-            roi = self._pending_center_roi
+        roi = self._pending_center_roi
+        if roi is not None and roi.file == fname:
             self._pending_center_roi = None
             self.gl.center_on_roi(roi.x, roi.y, roi.w, roi.h)
 
+    # ------------------------------------------------------------------
+    # LUT resolution: the single place deciding how a file's channels look
+    # ------------------------------------------------------------------
+    def _resolve_states(self, path: str, channels: list[nd2_loader.ChannelData], preset: dict | None = None,
+                        carried: dict[str, ChannelState] | None = None) -> tuple[list[ChannelState], set[str]]:
+        """Display settings for each channel of the file at `path`, plus the
+        names of the channels that came from its saved LUT. Precedence: the
+        file's saved LUT, then `preset` (an export-time choice), then the
+        settings carried over from previous files, then the Default LUT (if
+        enabled), then auto-contrast."""
+        folder, fname = os.path.split(path)
+        override = file_lut_store.load_override(folder, fname) or {}
+        preset = preset or {}
+        carried = self._carried if carried is None else carried
+        default = (self._default_lut_data or {}) if self._use_default_lut else {}
+
+        states, override_names = [], set()
+        for i, ch in enumerate(channels[:MAX_CHANNELS]):
+            palette_color = nd2_loader.default_color_for_channel(ch.name, i)
+            if ch.name in override:
+                st = _state_from_dict(ch.name, override[ch.name], palette_color)
+                override_names.add(ch.name)
+            elif ch.name in preset:
+                st = _state_from_dict(ch.name, preset[ch.name], palette_color)
+            elif ch.name in carried:
+                st = dataclasses.replace(carried[ch.name])
+            elif ch.name in default:
+                st = _state_from_dict(ch.name, default[ch.name], palette_color)
+            else:
+                black, white = nd2_loader.auto_levels(ch.stats, self._auto_headroom)
+                st = ChannelState(ch.name, palette_color, black, white, auto=True)
+            states.append(st)
+        return states, override_names
+
+    def _capture_carry(self):
+        """Remember the displayed file's settings for the next files, except
+        channels that came from its saved LUT: those are specific to it."""
+        for st in self.gl.get_states():
+            if st.name not in self._override_names:
+                self._carried[st.name] = dataclasses.replace(st, auto=False)
+
+    def _set_live_states(self, states: list[ChannelState]):
+        """Replace the displayed file's channel settings and sync the panels."""
+        for i, st in enumerate(states):
+            self.gl.set_channel_param(i, **dataclasses.asdict(st))
+            if i < len(self._panels):
+                self._panels[i].set_values(st.black, st.white, st.gamma, st.enabled, st.color)
+
+    def _rebuild_panels(self):
+        for p in self._panels:
+            p.setParent(None)
+            p.deleteLater()
+        self._panels = []
+        for i, (ch, st) in enumerate(zip(self._channels, self.gl.get_states())):
+            panel = ChannelPanel(i, ch.display_name, ch.stats.display_max)
+            panel.set_histogram(ch.hist_counts, ch.stats.display_max)
+            panel.set_values(st.black, st.white, st.gamma, st.enabled, st.color)
+            panel.changed.connect(self._on_panel_changed)
+            panel.autoRequested.connect(self._on_auto_requested)
+            panel.resetRequested.connect(self._on_reset_requested)
+            self.panel_layout.insertWidget(i, panel)
+            self._panels.append(panel)
+
+    def _on_panel_changed(self, index: int):
+        st = self.gl.get_states()[index]
+        vals = self._panels[index].values()
+        # The panel shows whole counts; only take black/white from it when
+        # the user actually moved them, so auto levels keep full precision.
+        if (vals["black"], vals["white"]) != (round(st.black), round(st.white)):
+            self.gl.set_channel_param(index, black=vals["black"], white=vals["white"], auto=False)
+        if _rgb255(vals["color"]) != _rgb255(st.color):
+            self.gl.set_channel_param(index, color=vals["color"])
+        self.gl.set_channel_param(index, gamma=vals["gamma"], enabled=vals["enabled"])
+
+    def _on_auto_requested(self, index: int):
+        st = self.gl.get_states()[index]
+        black, white = nd2_loader.auto_levels(self._channels[index].stats, self._auto_headroom)
+        self.gl.set_channel_param(index, black=black, white=white, auto=True)
+        self._panels[index].set_values(black, white, st.gamma, st.enabled, st.color)
+
+    def auto_all_channels(self):
+        for i in range(len(self.gl.get_states())):
+            self._on_auto_requested(i)
+        if self.gl.get_states():
+            self.status_label.setText("Auto-contrasted all channels of this file")
+
+    def _on_reset_requested(self, index: int):
+        st = self.gl.get_states()[index]
+        black, white = nd2_loader.auto_levels(self._channels[index].stats, self._auto_headroom)
+        color = nd2_loader.default_color_for_channel(st.name, index)
+        self.gl.set_channel_param(index, black=black, white=white, gamma=1.0, enabled=True,
+                                  color=color, auto=True)
+        self._panels[index].set_values(black, white, 1.0, True, color)
+
+    def _on_headroom_changed(self, value: float):
+        self._auto_headroom = value
+        self._settings.setValue("auto_headroom", value)
+        for i, st in enumerate(self.gl.get_states()):
+            if st.auto:
+                black, white = nd2_loader.auto_levels(self._channels[i].stats, value)
+                self.gl.set_channel_param(i, black=black, white=white)
+                self._panels[i].set_values(black, white, st.gamma, st.enabled, st.color)
+
+    def _reresolve_current(self, preset: dict | None = None):
+        """Re-derive the displayed file's settings, e.g. after its saved LUT
+        was removed. Discards unsaved tweaks."""
+        fname = self._current_file()
+        if fname is None or not self._channels:
+            return
+        states, self._override_names = self._resolve_states(self._path(self._current_index), self._channels, preset)
+        self._set_live_states(states)
+
+    # ------------------------------------------------------------------
+    # Per-file LUTs
+    # ------------------------------------------------------------------
+    def save_file_lut(self):
+        fname = self._current_file()
+        if fname is None:
+            return
+        data = {st.name: _state_to_dict(st) for st in self.gl.get_states()}
+        file_lut_store.save_override(self._folder, fname, data)
+        # From now on these settings belong to this file alone: they won't
+        # carry over to the next file.
+        self._override_names = set(data)
+        self._overridden_stems.add(os.path.splitext(fname)[0])
+        self._refresh_file_list_labels()
+        self.status_label.setText(f"Saved LUTs for {fname}")
+
+    def revert_file_lut(self):
+        fname = self._current_file()
+        if fname is None:
+            return
+        file_lut_store.clear_override(self._folder, fname)
+        self._overridden_stems.discard(os.path.splitext(fname)[0])
+        self._refresh_file_list_labels()
+        self._reresolve_current()
+        self.status_label.setText(f"Reverted {fname} to the carried-over settings")
+
+    # ------------------------------------------------------------------
+    # Measurement / ROI tools
+    # ------------------------------------------------------------------
     def _on_measured(self, result):
         if result is None:
             return
@@ -352,45 +616,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Measured: {dist_um:.2f} µm  ({dist_px:.1f} px)")
         else:
             self.status_label.setText(f"Measured: {dist_px:.1f} px  (no pixel calibration in this file)")
-
-    def _on_palette_changed(self, name: str):
-        if name not in nd2_loader.COLOR_PALETTES:
-            return
-        nd2_loader.set_active_palette(name)
-        self._settings.setValue("color_palette", name)
-
-        palette = nd2_loader.COLOR_PALETTES[name]
-        default_palette = nd2_loader.COLOR_PALETTES[nd2_loader.DEFAULT_PALETTE]
-        for i, st in enumerate(self.gl.get_states()):
-            w = nd2_loader.fluorophore_key_for_channel(st.name)
-            if w is None:
-                continue
-            color = palette.get(w) or default_palette[w]
-            self.gl.set_channel_param(i, color=color)
-            if i < len(self._panels):
-                self._panels[i]._set_color(color, emit=False)
-        self._carried_states.update({st.name: st for st in self.gl.get_states()})
-        self.status_label.setText(f"Color palette: {name}")
-
-    def save_new_palette(self):
-        name, ok = QInputDialog.getText(self, "Save Palette", "Palette name:")
-        if not ok or not name.strip():
-            return
-        name = name.strip()
-
-        # Start from the currently active palette so every standard channel
-        # has a color, then overlay whatever's actually on screen right now.
-        palette = dict(nd2_loader.COLOR_PALETTES[nd2_loader.get_active_palette()])
-        for st in self.gl.get_states():
-            w = nd2_loader.fluorophore_key_for_channel(st.name)
-            if w is not None:
-                palette[w] = st.color
-
-        nd2_loader.save_custom_palette(name, palette)
-        if self.palette_combo.findText(name) < 0:
-            self.palette_combo.addItem(name)
-        self.palette_combo.setCurrentText(name)
-        self.status_label.setText(f"Saved palette '{name}'")
 
     def _on_measure_toggled(self, checked: bool):
         self.gl.set_measure_mode(checked)
@@ -403,35 +628,37 @@ class MainWindow(QMainWindow):
             self.act_measure.setChecked(False)
 
     def _on_roi_drawn(self, x: float, y: float, w: float, h: float):
-        if not (0 <= self._current_index < len(self._files)):
+        fname = self._current_file()
+        if fname is None:
             return
         name, ok = QInputDialog.getText(self, "Name ROI", "Name:")
         if not ok or not name.strip():
             return
-        fname = self._files[self._current_index]
-        roi = roi_store.ROI.new(name.strip(), fname, x, y, w, h)
-        self._rois.append(roi)
+        self._rois.append(roi_store.ROI.new(name.strip(), fname, x, y, w, h))
+        self._rois_changed(fname)
+
+    def _rois_changed(self, fname: str):
         roi_store.save_rois(self._folder, self._rois)
         self._refresh_roi_list()
-        self.gl.set_rois([r for r in self._rois if r.file == fname])
+        if fname == self._current_file():
+            self.gl.set_rois([r for r in self._rois if r.file == fname])
 
     def _refresh_roi_list(self):
         self.roi_list.clear()
-        for roi in sorted(self._rois, key=lambda r: (r.file, r.name.lower())):
+        for roi in sorted(self._rois, key=lambda r: (_natural_key(r.file), r.name.lower())):
             item = QListWidgetItem(f"{roi.name}  —  {roi.file}")
             item.setData(Qt.UserRole, roi)
             self.roi_list.addItem(item)
 
     def _on_roi_list_clicked(self, item: QListWidgetItem):
         roi: roi_store.ROI = item.data(Qt.UserRole)
-        if not (0 <= self._current_index < len(self._files)) or self._files[self._current_index] != roi.file:
-            if roi.file not in self._files:
-                QMessageBox.warning(self, "File not found", f"{roi.file} is not in the current folder.")
-                return
+        if roi.file == self._current_file():
+            self.gl.center_on_roi(roi.x, roi.y, roi.w, roi.h)
+        elif roi.file in self._files:
             self._pending_center_roi = roi
             self.file_list.setCurrentRow(self._files.index(roi.file))
         else:
-            self.gl.center_on_roi(roi.x, roi.y, roi.w, roi.h)
+            QMessageBox.warning(self, "File not found", f"{roi.file} is not in the current folder.")
 
     def _rename_selected_roi(self):
         item = self.roi_list.currentItem()
@@ -439,13 +666,9 @@ class MainWindow(QMainWindow):
             return
         roi: roi_store.ROI = item.data(Qt.UserRole)
         name, ok = QInputDialog.getText(self, "Rename ROI", "Name:", text=roi.name)
-        if not ok or not name.strip():
-            return
-        roi.name = name.strip()
-        roi_store.save_rois(self._folder, self._rois)
-        self._refresh_roi_list()
-        if 0 <= self._current_index < len(self._files) and self._files[self._current_index] == roi.file:
-            self.gl.set_rois([r for r in self._rois if r.file == roi.file])
+        if ok and name.strip():
+            roi.name = name.strip()
+            self._rois_changed(roi.file)
 
     def _delete_selected_roi(self):
         item = self.roi_list.currentItem()
@@ -453,42 +676,10 @@ class MainWindow(QMainWindow):
             return
         roi: roi_store.ROI = item.data(Qt.UserRole)
         self._rois.remove(roi)
-        roi_store.save_rois(self._folder, self._rois)
-        self._refresh_roi_list()
-        if 0 <= self._current_index < len(self._files) and self._files[self._current_index] == roi.file:
-            self.gl.set_rois([r for r in self._rois if r.file == roi.file])
-
-    def _on_load_failed(self, err: str):
-        QMessageBox.critical(self, "Failed to load ND2", err)
-        self.status_label.setText("Load failed")
-
-    def _rebuild_panels(self, img: nd2_loader.Nd2Image):
-        for p in self._panels:
-            p.setParent(None)
-            p.deleteLater()
-        self._panels = []
-
-        states = self.gl.get_states()
-        for i, (ch, st) in enumerate(zip(img.channels, states)):
-            panel = ChannelPanel(
-                index=i, name=ch.display_name or ch.name, data_max=ch.data_max, color=st.color,
-                black=st.black, white=st.white, gamma=st.gamma, enabled=st.enabled,
-                default_black=ch.p_low, default_white=ch.p_high,
-            )
-            panel.set_histogram(ch.hist_counts, ch.data_max, st.color)
-            panel.changed.connect(self._on_panel_changed)
-            self.panel_layout.insertWidget(i, panel)
-            self._panels.append(panel)
-
-    def _on_panel_changed(self, index: int):
-        panel = self._panels[index]
-        vals = panel.values()
-        self.gl.set_channel_param(index, **vals)
-        panel.hist.set_data(panel.hist._counts, panel.hist._data_max, vals["color"])
-        panel.hist.set_markers(vals["black"], vals["white"])
+        self._rois_changed(roi.file)
 
     # ------------------------------------------------------------------
-    # Saving
+    # Export
     # ------------------------------------------------------------------
     def _save_array(self, arr: np.ndarray, out_path: str) -> bool:
         try:
@@ -503,54 +694,28 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _render_and_save(self, out_path: str, scale: float = 1.0) -> bool:
-        arr = self.gl.render_to_array(scale=scale)
-        if arr is None:
-            QMessageBox.warning(self, "Nothing to save", "No image is loaded.")
-            return False
-        return self._save_array(arr, out_path)
-
-    def _export_roi_crops(self, fname: str, out_dir: str, fmt: str, scale: float) -> int:
-        """Export each ROI belonging to `fname` as its own cropped image,
-        named `<basename>_<ROIName><ext>`. Returns the number exported."""
+    def _export_view_of(self, view: CompositeGLWidget, fname: str, out_dir: str, fmt: str,
+                        scale: float, rois_only: bool) -> int:
+        """Export what `view` shows for `fname`: its full composite, or one
+        crop per ROI named `<basename>_<ROIName><ext>`. Returns files written."""
+        base = os.path.splitext(fname)[0]
+        if not rois_only:
+            arr = view.render_to_array(scale=scale)
+            return int(arr is not None and self._save_array(arr, os.path.join(out_dir, f"{base}_composite{fmt}")))
         count = 0
         for roi in [r for r in self._rois if r.file == fname]:
-            arr = self.gl.render_region_to_array(roi.x, roi.y, roi.w, roi.h, scale=scale)
-            if arr is None:
-                continue
-            base = os.path.splitext(fname)[0]
+            arr = view.render_region_to_array(roi.x, roi.y, roi.w, roi.h, scale=scale)
             out_path = os.path.join(out_dir, f"{base}_{roi_store.safe_name(roi.name)}{fmt}")
-            if self._save_array(arr, out_path):
+            if arr is not None and self._save_array(arr, out_path):
                 count += 1
         return count
 
-    def save_file_lut(self):
-        """Save the current file's live channel LUT settings as its
-        per-file override, so returning to this file later (or exporting
-        it) automatically uses these settings instead of the standard
-        carried/default-LUT/auto-contrast values."""
-        if not (0 <= self._current_index < len(self._files)):
-            return
-        fname = self._files[self._current_index]
-        data = {
-            st.name: dict(black=st.black, white=st.white, gamma=st.gamma,
-                          enabled=st.enabled, color=list(st.color))
-            for st in self.gl.get_states()
-        }
-        file_lut_store.save_override(self._folder, fname, data)
-        self._overridden_stems.add(os.path.splitext(fname)[0])
-        self._refresh_file_list_labels()
-        self.status_label.setText(f"Saved LUT override for {fname}")
-
-    # ------------------------------------------------------------------
-    # Export dialog (scope, LUT preset, downsample, format, destination)
-    # ------------------------------------------------------------------
     def run_export_dialog(self):
-        if not self._files:
+        fname = self._current_file()
+        if fname is None:
             QMessageBox.information(self, "No files", "Open a folder first.")
             return
-        default_dir = self._last_out_dir or self._folder
-        dlg = ExportDialog(default_dir, initial_preset_path=self._last_preset_path, parent=self)
+        dlg = ExportDialog(self._last_out_dir or self._folder, parent=self)
         if dlg.exec() != QDialog.Accepted:
             return
         opts = dlg.get_options()
@@ -562,201 +727,184 @@ class MainWindow(QMainWindow):
             return
         self._last_out_dir = opts.out_dir
 
-        preset_names = None
+        preset = None
         if opts.preset_path:
             try:
-                with open(opts.preset_path) as f:
-                    data = json.load(f)
+                preset = _read_json(opts.preset_path)
             except Exception as e:
                 QMessageBox.critical(self, "Failed to load preset", str(e))
                 return
-            preset_names = set(data.keys())
-            self._carried_states.update(self._preset_dict_to_states(data))
-            self._apply_preset_data_to_live(data)
-            self._last_preset_path = opts.preset_path
+
+        if opts.export_rois:
+            has_rois = any(opts.scope_all_files or r.file == fname for r in self._rois)
+            if not has_rois:
+                where = "in this folder" if opts.scope_all_files else "on this file"
+                QMessageBox.information(self, "No ROIs", f"No ROIs have been drawn {where} yet.")
+                return
 
         if not opts.scope_all_files:
-            fname = self._files[self._current_index]
-            if preset_names is not None:
-                live_names = {st.name for st in self.gl.get_states()}
-                missing = live_names - preset_names
-                if missing:
-                    QMessageBox.warning(
-                        self, "Preset channel mismatch",
-                        f"This file has channel(s) not in the preset, using current/default "
-                        f"values instead: {', '.join(sorted(missing))}\n\n"
-                        f"Preset has: {', '.join(sorted(preset_names))}",
-                    )
-            if opts.export_rois:
-                n = self._export_roi_crops(fname, opts.out_dir, opts.fmt, opts.scale)
-                self.status_label.setText(
-                    f"Exported {n} ROI crop(s) to {opts.out_dir}" if n
-                    else f"No ROIs found for {fname}"
-                )
-                return
-            out_path = os.path.join(opts.out_dir, f"{os.path.splitext(fname)[0]}_composite{opts.fmt}")
-            if self._render_and_save(out_path, scale=opts.scale):
-                self.status_label.setText(f"Exported {out_path}")
+            if preset is not None:
+                self._reresolve_current(preset)
+            n = self._export_view_of(self.gl, fname, opts.out_dir, opts.fmt, opts.scale, opts.export_rois)
+            self.status_label.setText(f"Exported {n} file(s) to {opts.out_dir}")
             return
 
-        if opts.export_rois and not self._rois:
-            QMessageBox.information(self, "No ROIs", "No ROIs have been drawn in this folder.")
-            return
+        self._export_all_files(opts.out_dir, opts.fmt, opts.scale, preset, opts.export_rois)
 
-        self._export_all_files(opts.out_dir, opts.fmt, opts.scale, preset_names=preset_names,
-                                export_rois=opts.export_rois)
+    def _hidden_export_view(self) -> CompositeGLWidget:
+        """An off-screen compositor, so batch export never disturbs the view."""
+        if self._export_view is None:
+            self._export_view = CompositeGLWidget()
+            self._export_view.setAttribute(Qt.WA_DontShowOnScreen)
+            self._export_view.resize(64, 64)
+            self._export_view.show()  # creates its GL context without appearing
+        return self._export_view
 
-    def _export_all_files(self, out_dir: str, fmt: str, scale: float, preset_names: set[str] | None = None,
-                           export_rois: bool = False):
-        if export_rois:
+    def _export_all_files(self, out_dir: str, fmt: str, scale: float, preset: dict | None, rois_only: bool):
+        """Export every file (or only those with ROIs). Each file gets its
+        saved LUT if it has one; every other file gets `preset` if given,
+        else what's on screen now (as it would carry over), else the
+        Default LUT / auto-contrast."""
+        targets = self._files
+        if rois_only:
             roi_files = {r.file for r in self._rois}
-            target_files = [f for f in self._files if f in roi_files]
-        else:
-            target_files = self._files
+            targets = [f for f in self._files if f in roi_files]
 
-        progress = QProgressDialog("Exporting composites…", "Cancel", 0, len(target_files), self)
+        self._capture_carry()
+        carried = {name: dataclasses.replace(st) for name, st in self._carried.items()}
+        view = self._hidden_export_view()
+
+        progress = QProgressDialog("Exporting…", "Cancel", 0, len(targets), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        written, failed = 0, []
+        try:
+            for i, fname in enumerate(targets):
+                if progress.wasCanceled():
+                    break
+                progress.setValue(i)
+                progress.setLabelText(f"Exporting {fname}")
+                QApplication.processEvents()
+                try:
+                    img = nd2_loader.load_nd2(os.path.join(self._folder, fname))
+                except Exception as e:
+                    failed.append(f"{fname}: {e}")
+                    continue
+                states, _ = self._resolve_states(img.path, img.channels, preset, carried)
+                view.set_image(img, states)
+                del img  # the pixels are on the GPU now
+                written += self._export_view_of(view, fname, out_dir, fmt, scale, rois_only)
+            progress.setValue(len(targets))
+        finally:
+            view.clear()
 
-        unmatched: dict[str, set[str]] = {}
-        roi_count = 0
-        for i, fname in enumerate(target_files):
-            if progress.wasCanceled():
-                break
-            progress.setValue(i)
-            progress.setLabelText(f"Exporting {fname}")
-            QApplication.processEvents()
-
-            path = os.path.join(self._folder, fname)
-            try:
-                img = nd2_loader.load_nd2(path)
-            except Exception as e:
-                QMessageBox.warning(self, "Skipped", f"Failed to load {fname}: {e}")
-                continue
-
-            if preset_names is not None:
-                missing = {c.name for c in img.channels} - preset_names
-                if missing:
-                    unmatched[fname] = missing
-
-            effective = self._effective_carried_states([c.name for c in img.channels])
-            self.gl.set_image(img, carried_states=effective)
-            self._carried_states.update({st.name: st for st in self.gl.get_states()})
-
-            if export_rois:
-                roi_count += self._export_roi_crops(fname, out_dir, fmt, scale)
-            else:
-                out_path = os.path.join(out_dir, f"{os.path.splitext(fname)[0]}_composite{fmt}")
-                self._render_and_save(out_path, scale=scale)
-
-        progress.setValue(len(target_files))
-
-        if unmatched:
-            lines = [f"{fname}: {', '.join(sorted(names))}" for fname, names in unmatched.items()]
-            QMessageBox.warning(
-                self, "Preset channel mismatch",
-                "The preset didn't cover every channel in these files (they used "
-                "current/default values instead):\n\n" + "\n".join(lines[:15])
-                + ("\n…" if len(lines) > 15 else ""),
-            )
-
-        self.status_label.setText(f"Exported {roi_count} ROI crop(s)" if export_rois else "Export complete")
-        # Reload currently-selected file so the on-screen view matches the list selection.
-        if 0 <= self._current_index < len(self._files):
-            self._load_file(os.path.join(self._folder, self._files[self._current_index]))
+        if failed:
+            QMessageBox.warning(self, "Some files skipped",
+                                "Couldn't load:\n\n" + "\n".join(failed[:15]) + ("\n…" if len(failed) > 15 else ""))
+        self.status_label.setText(f"Exported {written} file(s) to {out_dir}")
 
     # ------------------------------------------------------------------
-    # Presets
+    # Presets and Default LUT
     # ------------------------------------------------------------------
-    @staticmethod
-    def _preset_dict_to_states(data: dict) -> dict[str, ChannelState]:
-        return {
-            name: ChannelState(
-                name=name, data_max=65535, color=tuple(vals["color"]),
-                black=vals["black"], white=vals["white"], gamma=vals["gamma"],
-                enabled=vals["enabled"],
-            )
-            for name, vals in data.items()
-        }
-
-    def _apply_preset_data_to_live(self, data: dict):
-        """Push preset values onto the currently loaded channels/panels, if any match by name."""
-        for i, st in enumerate(self.gl.get_states()):
-            if st.name in data:
-                v = data[st.name]
-                self.gl.set_channel_param(i, black=v["black"], white=v["white"],
-                                           gamma=v["gamma"], enabled=v["enabled"],
-                                           color=tuple(v["color"]))
-                if i < len(self._panels):
-                    self._panels[i].set_values(v["black"], v["white"], v["gamma"],
-                                                v["enabled"], tuple(v["color"]))
-
     def save_preset(self):
-        if not self._carried_states:
+        if not self.gl.get_states():
             QMessageBox.information(self, "No data", "Load a file first.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save LUT preset", "lut_preset.json", "JSON (*.json)")
         if not path:
             return
-        data = {
-            name: dict(black=st.black, white=st.white, gamma=st.gamma,
-                       enabled=st.enabled, color=list(st.color))
-            for name, st in self._carried_states.items()
-        }
         with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        self._last_preset_path = path
+            json.dump({st.name: _state_to_dict(st) for st in self.gl.get_states()}, f, indent=2)
         self.status_label.setText(f"Preset saved to {path}")
 
     def load_preset(self):
+        if not self.gl.get_states():
+            QMessageBox.information(self, "No data", "Load a file first.")
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load LUT preset", "", "JSON (*.json)")
         if not path:
             return
-        with open(path) as f:
-            data = json.load(f)
-        self._carried_states.update(self._preset_dict_to_states(data))
-        self._apply_preset_data_to_live(data)
-        self._last_preset_path = path
-        self.status_label.setText(f"Preset loaded from {path}")
+        try:
+            data = _read_json(path)
+            matched = self._apply_preset_live(data)
+        except Exception as e:
+            QMessageBox.critical(self, "Failed to load preset", str(e))
+            return
+        self.status_label.setText(f"Applied {matched} channel(s) from {os.path.basename(path)}")
 
-    # ------------------------------------------------------------------
-    # Default LUT (used instead of auto-contrast for channels with no
-    # carried-over value yet, e.g. the first time a channel name is seen)
-    # ------------------------------------------------------------------
+    def _apply_preset_live(self, data: dict, skip_saved: bool = False) -> int:
+        """Apply preset values to the displayed file's matching channels
+        (optionally leaving channels from its saved LUT alone). Returns how
+        many channels matched."""
+        names = {st.name for st in self.gl.get_states() if st.name in data
+                 and not (skip_saved and st.name in self._override_names)}
+        self._set_live_states([
+            _state_from_dict(st.name, data[st.name], st.color) if st.name in names else st
+            for st in self.gl.get_states()
+        ])
+        return len(names)
+
     def set_default_lut(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose default LUT preset", "", "JSON (*.json)")
         if not path:
             return
         try:
-            with open(path) as f:
-                data = json.load(f)
+            data = _read_json(path)
         except Exception as e:
             QMessageBox.critical(self, "Failed to load preset", str(e))
             return
         self._default_lut_path = path
         self._default_lut_data = data
-        self._use_default_lut = True
         self._settings.setValue("default_lut_path", path)
-        self._settings.setValue("use_default_lut", True)
         self.act_use_default_lut.setEnabled(True)
-        self.act_use_default_lut.setChecked(True)
+        if self.act_use_default_lut.isChecked():
+            self._apply_preset_live(data, skip_saved=True)
+        else:
+            self.act_use_default_lut.setChecked(True)  # applies it via the toggle
         self.status_label.setText(f"Default LUT set to {path}")
 
     def _toggle_use_default_lut(self, checked: bool):
         self._use_default_lut = checked
         self._settings.setValue("use_default_lut", checked)
+        # Turning it on applies it now (and so it carries on from here);
+        # turning it off just stops it seeding channels with nothing carried.
+        if checked and self._default_lut_data:
+            self._apply_preset_live(self._default_lut_data, skip_saved=True)
 
-    def _effective_carried_states(self, channel_names: list[str]) -> dict[str, ChannelState]:
-        """`_carried_states`, plus default-LUT values for any of `channel_names`
-        that have no carried value yet. Session-carried values always win over
-        the default; auto-contrast is still the fallback for channels absent
-        from both."""
-        if not self._use_default_lut or not self._default_lut_data:
-            return self._carried_states
-        missing = [n for n in channel_names if n not in self._carried_states and n in self._default_lut_data]
-        if not missing:
-            return self._carried_states
-        merged = dict(self._carried_states)
-        for name in missing:
-            merged[name] = self._preset_dict_to_states({name: self._default_lut_data[name]})[name]
-        return merged
+    # ------------------------------------------------------------------
+    # Palettes
+    # ------------------------------------------------------------------
+    def _on_palette_changed(self, name: str):
+        if name not in nd2_loader.COLOR_PALETTES:
+            return
+        nd2_loader.set_active_palette(name)
+        self._settings.setValue("color_palette", name)
+        for i, st in enumerate(self.gl.get_states()):
+            if nd2_loader.fluorophore_key_for_channel(st.name) is None:
+                continue
+            color = nd2_loader.default_color_for_channel(st.name, i)
+            self.gl.set_channel_param(i, color=color)
+            self._panels[i].set_color(color)
+        # Recolor carried settings too, for channels not in this file.
+        for name, st in self._carried.items():
+            if nd2_loader.fluorophore_key_for_channel(name) is not None:
+                st.color = nd2_loader.default_color_for_channel(name, 0)
+        self.status_label.setText(f"Color palette: {name}")
+
+    def save_new_palette(self):
+        name, ok = QInputDialog.getText(self, "Save Palette", "Palette name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        # Start from the active palette so every standard channel has a
+        # color, then overlay whatever's on screen right now.
+        palette = dict(nd2_loader.COLOR_PALETTES[nd2_loader.get_active_palette()])
+        for st in self.gl.get_states():
+            key = nd2_loader.fluorophore_key_for_channel(st.name)
+            if key is not None:
+                palette[key] = tuple(st.color)
+        nd2_loader.save_custom_palette(name, palette)
+        if self.palette_combo.findText(name) < 0:
+            self.palette_combo.addItem(name)
+        self.palette_combo.setCurrentText(name)
+        self.status_label.setText(f"Saved palette '{name}'")

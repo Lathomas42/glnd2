@@ -8,37 +8,158 @@ regardless of source image size.
 from __future__ import annotations
 
 import ctypes
-import os
-
 import math
+import os
+from dataclasses import dataclass
 
 import numpy as np
 from OpenGL import GL as gl
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QSurfaceFormat, QWheelEvent
+from PySide6.QtGui import QColor, QMouseEvent, QOpenGLContext, QPainter, QPen, QSurfaceFormat, QWheelEvent
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 MAX_CHANNELS = 8
 _SHADER_DIR = os.path.join(os.path.dirname(__file__), "shaders")
+_PER_CHANNEL_UNIFORMS = ("uTex", "uComp", "uEnabled", "uBlack", "uWhite", "uGamma", "uColor")
+# (internal format, pixel format) for a texture packing 1..4 channels.
+_PACKED_FORMATS = {
+    1: (gl.GL_R16, gl.GL_RED),
+    2: (gl.GL_RG16, gl.GL_RG),
+    3: (gl.GL_RGB16, gl.GL_RGB),
+    4: (gl.GL_RGBA16, gl.GL_RGBA),
+}
 
 
+@dataclass
 class ChannelState:
-    def __init__(self, name, data_max, color, black, white, gamma=1.0, enabled=True):
-        self.name = name
-        self.data_max = data_max
-        self.color = color
-        self.black = black
-        self.white = white
-        self.gamma = gamma
-        self.enabled = enabled
+    """Display settings for one channel. `name` is the raw ND2 channel name."""
+    name: str
+    color: tuple[float, float, float]
+    black: float
+    white: float
+    gamma: float = 1.0
+    enabled: bool = True
+    # True while black/white still come from auto-contrast, i.e. the user
+    # hasn't hand-tuned them; such channels follow the auto-headroom knob.
+    auto: bool = False
 
 
 def default_gl_format() -> QSurfaceFormat:
+    # 4.1 core is the newest profile macOS supports.
     fmt = QSurfaceFormat()
-    fmt.setVersion(4, 3)
+    fmt.setVersion(4, 1)
     fmt.setProfile(QSurfaceFormat.CoreProfile)
     fmt.setSwapInterval(1)
     return fmt
+
+
+@dataclass
+class GpuTextures:
+    """An image's channels, already on the GPU as mipmapped textures in the GL
+    namespace shared by every context in the app."""
+    ids: list[int]  # every texture to free
+    channels: list[tuple[int, int]]  # per channel: (texture id, component 0-3)
+    step: int  # downsampling applied to fit GL_MAX_TEXTURE_SIZE (1 = none)
+
+
+def _compile_program(vert_name: str, frag_name: str) -> int:
+    def compile_shader(name, kind):
+        with open(os.path.join(_SHADER_DIR, name)) as f:
+            src = f.read()
+        sid = gl.glCreateShader(kind)
+        gl.glShaderSource(sid, src)
+        gl.glCompileShader(sid)
+        if not gl.glGetShaderiv(sid, gl.GL_COMPILE_STATUS):
+            raise RuntimeError(gl.glGetShaderInfoLog(sid).decode())
+        return sid
+
+    vert = compile_shader(vert_name, gl.GL_VERTEX_SHADER)
+    frag = compile_shader(frag_name, gl.GL_FRAGMENT_SHADER)
+    program = gl.glCreateProgram()
+    gl.glAttachShader(program, vert)
+    gl.glAttachShader(program, frag)
+    gl.glLinkProgram(program)
+    gl.glDeleteShader(vert)
+    gl.glDeleteShader(frag)
+    if not gl.glGetProgramiv(program, gl.GL_LINK_STATUS):
+        raise RuntimeError(gl.glGetProgramInfoLog(program).decode())
+    return program
+
+
+def _new_texture(internal_format, pixel_format, data: np.ndarray) -> int:
+    tex = gl.glGenTextures(1)
+    gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+    # Mipmapped minification: zoomed out, each screen pixel averages the image
+    # pixels under it instead of point-sampling one, so small bright cells
+    # don't shimmer or vanish. (Most of a big image's upload time is the
+    # driver re-laying out the texture for mipmaps; a hand-written mip shader
+    # wasn't meaningfully faster.)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+    h, w = data.shape[:2]
+    gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, internal_format, w, h, 0, pixel_format, gl.GL_UNSIGNED_SHORT, data)
+    gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+    return tex
+
+
+def upload_textures(nd2_image) -> GpuTextures:
+    """Put an image's channels on the GPU, in the current GL context.
+
+    Interleaved images with up to four channels go up as a single texture
+    straight from the file's buffer (no per-channel copies); anything else
+    gets one single-channel texture per channel.
+    """
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+    max_tex = gl.glGetIntegerv(gl.GL_MAX_TEXTURE_SIZE)
+    longest = max(nd2_image.width, nd2_image.height)
+    step = -(-longest // max_tex) if longest > max_tex else 1  # ceil division
+    ids, channels = [], []
+    try:
+        packed = getattr(nd2_image, "packed", None)
+        if step == 1 and packed is not None:
+            tex = _new_texture(*_PACKED_FORMATS[packed.shape[2]], packed)
+            ids.append(tex)
+            channels = [(tex, k) for k in range(packed.shape[2])]
+        else:
+            for ch in nd2_image.channels[:MAX_CHANNELS]:
+                tex = _new_texture(gl.GL_R16, gl.GL_RED, np.ascontiguousarray(ch.array[::step, ::step]))
+                ids.append(tex)
+                channels.append((tex, 0))
+    except Exception:
+        if ids:
+            gl.glDeleteTextures(ids)
+        raise
+    finally:
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+    return GpuTextures(ids, channels, step)
+
+
+def upload_in_background(nd2_image, surface) -> bool:
+    """For a worker thread: upload `nd2_image` through a temporary context that
+    shares textures with the viewer, attach the result as `nd2_image.gpu`, and
+    drop the CPU pixel copies. Returns False (image untouched) if that isn't
+    possible, in which case the viewer uploads it itself when shown."""
+    share = QOpenGLContext.globalShareContext()
+    if surface is None or share is None:
+        return False
+    ctx = QOpenGLContext()
+    ctx.setShareContext(share)
+    ctx.setFormat(default_gl_format())
+    if not ctx.create() or not ctx.makeCurrent(surface):
+        return False
+    try:
+        nd2_image.gpu = upload_textures(nd2_image)
+        gl.glFinish()  # complete before another context samples them
+    except Exception:
+        return False
+    finally:
+        ctx.doneCurrent()
+    nd2_image.packed = None
+    for ch in nd2_image.channels:
+        ch.array = None
+    return True
 
 
 class CompositeGLWidget(QOpenGLWidget):
@@ -54,8 +175,10 @@ class CompositeGLWidget(QOpenGLWidget):
         self.setFormat(default_gl_format())
 
         self._program = None
+        self._uniforms: dict[str, int] = {}
         self._vao = None
         self._textures: list[int] = []
+        self._channel_tex: list[tuple[int, int]] = []  # per channel: (texture, component)
         self._states: list[ChannelState] = []
         self._img_w = 0
         self._img_h = 0
@@ -83,38 +206,14 @@ class CompositeGLWidget(QOpenGLWidget):
     # GL setup
     # ------------------------------------------------------------------
     def initializeGL(self):
-        self._program = self._build_program()
+        self._program = _compile_program("composite.vert", "composite.frag")
+        names = ["uScale", "uPan", "uCount"] + [
+            f"{u}[{i}]" for u in _PER_CHANNEL_UNIFORMS for i in range(MAX_CHANNELS)
+        ]
+        self._uniforms = {n: gl.glGetUniformLocation(self._program, n) for n in names}
         self._build_quad()
         gl.glClearColor(0.06, 0.06, 0.08, 1.0)
         gl.glDisable(gl.GL_DEPTH_TEST)
-
-    def _build_program(self):
-        with open(os.path.join(_SHADER_DIR, "composite.vert")) as f:
-            vert_src = f.read()
-        with open(os.path.join(_SHADER_DIR, "composite.frag")) as f:
-            frag_src = f.read()
-
-        def compile_shader(src, kind):
-            sid = gl.glCreateShader(kind)
-            gl.glShaderSource(sid, src)
-            gl.glCompileShader(sid)
-            if not gl.glGetShaderiv(sid, gl.GL_COMPILE_STATUS):
-                raise RuntimeError(gl.glGetShaderInfoLog(sid).decode())
-            return sid
-
-        vert = compile_shader(vert_src, gl.GL_VERTEX_SHADER)
-        frag = compile_shader(frag_src, gl.GL_FRAGMENT_SHADER)
-
-        program = gl.glCreateProgram()
-        gl.glAttachShader(program, vert)
-        gl.glAttachShader(program, frag)
-        gl.glLinkProgram(program)
-        if not gl.glGetProgramiv(program, gl.GL_LINK_STATUS):
-            raise RuntimeError(gl.glGetProgramInfoLog(program).decode())
-
-        gl.glDeleteShader(vert)
-        gl.glDeleteShader(frag)
-        return program
 
     def _build_quad(self):
         # xy in [-1,1], uv with row 0 = image top
@@ -151,59 +250,23 @@ class CompositeGLWidget(QOpenGLWidget):
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
-    def set_image(self, nd2_image, carried_states: dict[str, ChannelState] | None = None):
-        """Upload a new image's channels as GPU textures.
-
-        `carried_states` maps channel name -> previous ChannelState, used to
-        keep LUT settings consistent across files in a batch when channel
-        names match (e.g. same wavelength setup across an acquisition run).
+    def set_image(self, nd2_image, states: list[ChannelState]):
+        """Display `nd2_image` with `states` (one per channel, in channel
+        order). Uses its pre-uploaded textures (`nd2_image.gpu`, taking
+        ownership) if a loader thread made them, else uploads now. Deciding
+        the states is the caller's job, so the screen and exports agree.
         """
         self.makeCurrent()
-
         if self._textures:
             gl.glDeleteTextures(self._textures)
-        self._textures = []
-        self._states = []
-
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        carried_states = carried_states or {}
-
-        max_tex = gl.glGetIntegerv(gl.GL_MAX_TEXTURE_SIZE)
-        longest = max(nd2_image.width, nd2_image.height)
-        self._downsampled = longest > max_tex
-        step = 1
-        if self._downsampled:
-            step = -(-longest // max_tex)  # ceil division
-
-        for ch in nd2_image.channels[:MAX_CHANNELS]:
-            plane = ch.array[::step, ::step] if step > 1 else ch.array
-            tex = gl.glGenTextures(1)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-            h, w = plane.shape
-            gl.glTexImage2D(
-                gl.GL_TEXTURE_2D, 0, gl.GL_R16, w, h, 0,
-                gl.GL_RED, gl.GL_UNSIGNED_SHORT, np.ascontiguousarray(plane),
-            )
-            self._textures.append(tex)
-
-            prev = carried_states.get(ch.name)
-            if prev is not None:
-                state = ChannelState(
-                    name=ch.name, data_max=max(ch.data_max, 1), color=prev.color,
-                    black=prev.black, white=prev.white, gamma=prev.gamma, enabled=prev.enabled,
-                )
-            else:
-                state = ChannelState(
-                    name=ch.name, data_max=max(ch.data_max, 1), color=ch.default_color,
-                    black=ch.p_low, white=ch.p_high, gamma=1.0, enabled=True,
-                )
-            self._states.append(state)
-
-        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        gpu, nd2_image.gpu = nd2_image.gpu, None
+        if gpu is None:
+            gpu = upload_textures(nd2_image)
+        self._textures = gpu.ids
+        self._channel_tex = gpu.channels
+        self._states = list(states[:MAX_CHANNELS])
+        step = gpu.step
+        self._downsampled = step > 1
         self._img_w = -(-nd2_image.width // step)
         self._img_h = -(-nd2_image.height // step)
         self._downsample_step = step
@@ -217,6 +280,25 @@ class CompositeGLWidget(QOpenGLWidget):
         self.doneCurrent()
         self.measured.emit(None)
         self.update()
+
+    def clear(self):
+        """Drop the current image and free its GPU memory."""
+        if self._textures:
+            self.makeCurrent()
+            gl.glDeleteTextures(self._textures)
+            self.doneCurrent()
+        self._textures = []
+        self._channel_tex = []
+        self._states = []
+        self.update()
+
+    def discard(self, nd2_image):
+        """Free the pre-uploaded textures of an image that won't be shown."""
+        if nd2_image.gpu is not None:
+            self.makeCurrent()
+            gl.glDeleteTextures(nd2_image.gpu.ids)
+            self.doneCurrent()
+            nd2_image.gpu = None
 
     def is_downsampled(self) -> bool:
         """True if the last loaded image exceeded GL_MAX_TEXTURE_SIZE and had
@@ -342,20 +424,23 @@ class CompositeGLWidget(QOpenGLWidget):
         self._draw_with_transform(sx, sy, self._pan[0], self._pan[1])
 
     def _draw_with_transform(self, scale_x: float, scale_y: float, pan_x: float, pan_y: float):
+        u = self._uniforms
         gl.glUseProgram(self._program)
-        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uScale"), scale_x, scale_y)
-        gl.glUniform2f(gl.glGetUniformLocation(self._program, "uPan"), pan_x, pan_y)
-        gl.glUniform1i(gl.glGetUniformLocation(self._program, "uCount"), len(self._states))
+        gl.glUniform2f(u["uScale"], scale_x, scale_y)
+        gl.glUniform2f(u["uPan"], pan_x, pan_y)
+        gl.glUniform1i(u["uCount"], len(self._states))
 
         for i, st in enumerate(self._states):
+            tex, component = self._channel_tex[i]
             gl.glActiveTexture(gl.GL_TEXTURE0 + i)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, self._textures[i])
-            gl.glUniform1i(gl.glGetUniformLocation(self._program, f"uTex[{i}]"), i)
-            gl.glUniform1i(gl.glGetUniformLocation(self._program, f"uEnabled[{i}]"), 1 if st.enabled else 0)
-            gl.glUniform1f(gl.glGetUniformLocation(self._program, f"uBlack[{i}]"), st.black / 65535.0)
-            gl.glUniform1f(gl.glGetUniformLocation(self._program, f"uWhite[{i}]"), st.white / 65535.0)
-            gl.glUniform1f(gl.glGetUniformLocation(self._program, f"uGamma[{i}]"), st.gamma)
-            gl.glUniform3f(gl.glGetUniformLocation(self._program, f"uColor[{i}]"), *st.color)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+            gl.glUniform1i(u[f"uTex[{i}]"], i)
+            gl.glUniform1i(u[f"uComp[{i}]"], component)
+            gl.glUniform1i(u[f"uEnabled[{i}]"], 1 if st.enabled else 0)
+            gl.glUniform1f(u[f"uBlack[{i}]"], st.black / 65535.0)
+            gl.glUniform1f(u[f"uWhite[{i}]"], st.white / 65535.0)
+            gl.glUniform1f(u[f"uGamma[{i}]"], st.gamma)
+            gl.glUniform3f(u[f"uColor[{i}]"], *st.color)
 
         gl.glBindVertexArray(self._vao)
         gl.glDrawElements(gl.GL_TRIANGLES, 6, gl.GL_UNSIGNED_INT, None)
@@ -532,13 +617,17 @@ class CompositeGLWidget(QOpenGLWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self._roi_mode and event.button() == Qt.LeftButton and self._roi_drag_start is not None:
             (x1, y1), (x2, y2) = self._roi_drag_start, self._roi_drag_current
-            x, y = min(x1, x2), min(y1, y2)
-            w, h = abs(x2 - x1), abs(y2 - y1)
+            # Snap to whole pixels inside the image, so crops are exact and
+            # a drag that strays past the edge doesn't export black margin.
+            def clamp(v, hi):
+                return int(round(min(max(v, 0.0), hi)))
+            left, right = clamp(min(x1, x2), self._img_w), clamp(max(x1, x2), self._img_w)
+            top, bottom = clamp(min(y1, y2), self._img_h), clamp(max(y1, y2), self._img_h)
             self._roi_drag_start = None
             self._roi_drag_current = None
             self.update()
-            if w >= 5 and h >= 5:  # ignore accidental clicks/tiny drags
-                self.roiDrawn.emit(x, y, w, h)
+            if right - left >= 5 and bottom - top >= 5:  # ignore accidental clicks/tiny drags
+                self.roiDrawn.emit(float(left), float(top), float(right - left), float(bottom - top))
             return
         self._drag_start = None
 

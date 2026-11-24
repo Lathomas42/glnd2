@@ -1,11 +1,14 @@
-#version 430 core
+#version 410 core
 
 #define MAX_CHANNELS 8
 
 in vec2 vTex;
 out vec4 fragColor;
 
+// Channel i is component uComp[i] of texture uTex[i] (several channels may
+// share one multi-component texture).
 uniform sampler2D uTex[MAX_CHANNELS];
+uniform int uComp[MAX_CHANNELS];
 uniform int uCount;
 uniform int uEnabled[MAX_CHANNELS];
 uniform float uBlack[MAX_CHANNELS];
@@ -19,7 +22,7 @@ void main() {
         if (i >= uCount) break;
         if (uEnabled[i] == 0) continue;
 
-        float v = texture(uTex[i], vTex).r;
+        float v = texture(uTex[i], vTex)[uComp[i]];
         float black = uBlack[i];
         float white = max(uWhite[i], black + 1e-6);
         float g = max(uGamma[i], 0.01);
