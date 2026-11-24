@@ -1,0 +1,93 @@
+# Builds standalone glnd2 apps for Windows, macOS and Linux with PyInstaller.
+#   - Actions tab > "Build" > Run workflow: builds downloadable artifacts.
+#   - Pushing a tag like v0.2.0: also publishes them as a GitHub Release.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-15-intel
+            name: macos-x64
+          # Oldest supported runner, so the build runs on older glibc distros.
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Linux system libraries for Qt
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+      - name: Build
+        run: pyinstaller --noconfirm glnd2.spec
+
+      # The runners have no GPU, so this checks the bundle is complete
+      # (modules, shaders, icon, image writers) rather than rendering.
+      - name: Self-check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # A windowed exe returns immediately unless waited on.
+          $p = Start-Process -FilePath dist\glnd2\glnd2.exe -ArgumentList '--check' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-check failed: $($p.ExitCode)" }
+      - name: Self-check (macOS)
+        if: runner.os == 'macOS'
+        run: dist/glnd2.app/Contents/MacOS/glnd2 --check
+      - name: Self-check (Linux)
+        if: runner.os == 'Linux'
+        run: dist/glnd2/glnd2 --check
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\glnd2 -DestinationPath glnd2-${{ matrix.name }}.zip
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        # ditto keeps the bundle's symlinks and code signature intact.
+        run: ditto -c -k --keepParent dist/glnd2.app glnd2-${{ matrix.name }}.zip
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf glnd2-${{ matrix.name }}.tar.gz -C dist glnd2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glnd2-${{ matrix.name }}
+          path: glnd2-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: glnd2-*
+          generate_release_notes: true

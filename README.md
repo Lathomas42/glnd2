@@ -8,7 +8,23 @@ Each channel is uploaded once to the GPU as a 16-bit texture; black point,
 white point, gamma, tint and additive blending all happen per-frame in a
 fragment shader, so dragging sliders stays instant regardless of image size.
 
-## Install and run
+## Download (no Python needed)
+
+Ready-made apps are on the repo's **Releases** page (or, for the latest
+build, the **Actions** tab > **Build** > a run > *Artifacts*):
+
+- **Windows**: unzip `glnd2-windows-x64.zip`, run `glnd2\glnd2.exe`. Keep the
+  `_internal` folder next to it. If SmartScreen warns about an unrecognized
+  app, choose *More info* > *Run anyway*.
+- **macOS**: unzip and drag `glnd2.app` to Applications (`macos-arm64` for
+  Apple Silicon, `macos-x64` for Intel). The app is unsigned, so the first
+  launch is blocked: open *System Settings* > *Privacy & Security* and click
+  *Open Anyway*, or run `xattr -dr com.apple.quarantine /Applications/glnd2.app`.
+- **Linux**: `tar -xzf glnd2-linux-x64.tar.gz` and run `glnd2/glnd2`.
+
+`glnd2 --check [file.nd2]` verifies an install without opening a window.
+
+## Run from source
 
 ```bash
 pip install -r requirements.txt
@@ -49,7 +65,9 @@ has to upload it to the GPU.
 - Per-channel controls: visibility, color, black/white point, gamma, histogram
 - Channels recognized by wavelength (`640 nm`) or name (`AF647 Prescan`, `GFP`)
   and labeled by fluorophore; switchable color palettes, plus your own
-  (**Save Palette…**, stored locally in `palettes/`)
+  (**Save Palette…**, stored in `palettes/` when run from source, or the user
+  data folder for the downloaded app: `%APPDATA%\glnd2`,
+  `~/Library/Application Support/glnd2`, `~/.local/share/glnd2`)
 - **Export…** (`Ctrl+E`): current file or whole folder, PNG/TIFF, downsampling,
   optional preset, or just the ROI rectangles
 - **Measure** (`Ctrl+M`): two-click ruler in µm (from the ND2's calibration)
@@ -70,3 +88,17 @@ has to upload it to the GPU.
 - `channel_panel.py`: per-channel LUT controls
 - `nd2_loader.py`: ND2 reading, intensity stats, auto-contrast, palettes
 - `export_dialog.py`, `roi_store.py`, `file_lut_store.py`
+- `icons/`: app icon (`glnd2.svg`; `make_icons.py` regenerates the rest)
+
+## Building the apps
+
+`.github/workflows/build.yml` builds all platforms with PyInstaller
+(`glnd2.spec`). Run it from the Actions tab, or publish a release by pushing a
+tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+To build locally (each OS builds only its own app):
+`pip install pyinstaller && pyinstaller glnd2.spec`, output in `dist/`.

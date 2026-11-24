@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#161a2b"/>
+      <stop offset="1" stop-color="#07080f"/>
+    </linearGradient>
+    <linearGradient id="tissue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b6bff"/>
+      <stop offset="0.55" stop-color="#8a3dff"/>
+      <stop offset="1" stop-color="#ff2f9a"/>
+    </linearGradient>
+    <radialGradient id="lensbg" cx="0.4" cy="0.35" r="0.75">
+      <stop offset="0" stop-color="#1b2140"/>
+      <stop offset="1" stop-color="#05060c"/>
+    </radialGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="lensclip"><circle cx="182" cy="178" r="40"/></clipPath>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+
+  <!-- brain, sagittal, facing right: cerebrum, cerebellum, brainstem -->
+  <g transform="translate(262 -4) scale(-1.08 1.08)">
+    <path d="M150 168 C152 182 150 196 144 206 L128 206 C132 194 132 182 128 170 Z"
+          fill="#2f9bff"/>
+    <path d="M146 150 C168 144 194 148 198 162 C200 178 182 186 162 184 C148 182 140 170 146 150 Z"
+          fill="#ff4fb0"/>
+    <g fill="none" stroke="#ffd0ec" stroke-width="2.5" stroke-linecap="round" opacity="0.8">
+      <path d="M156 160 C170 156 184 158 192 164"/>
+      <path d="M152 170 C166 168 180 172 188 176"/>
+    </g>
+    <path d="M58 150 C36 142 30 112 44 92 C46 66 72 48 98 54 C112 38 146 34 166 48
+             C192 46 214 66 212 92 C226 108 218 138 196 146 C186 160 164 162 150 156
+             C134 166 110 166 96 160 C82 166 66 160 58 150 Z"
+          fill="url(#tissue)"/>
+    <!-- folds in a bright "488" green: Sylvian fissure, central sulcus, gyri -->
+    <g fill="none" stroke="#4dff7c" stroke-width="5" stroke-linecap="round">
+      <path d="M78 134 C100 120 128 118 156 110"/>
+      <path d="M126 44 C118 64 134 80 124 116"/>
+      <path d="M50 108 C62 100 70 110 82 100 C92 92 84 78 98 70"/>
+      <path d="M100 98 C108 92 104 82 112 76"/>
+      <path d="M150 58 C158 72 172 66 180 80 C186 90 178 98 188 106"/>
+      <path d="M144 88 C152 84 160 92 166 88"/>
+      <path d="M90 150 C104 142 118 152 134 144"/>
+      <path d="M176 128 C186 122 196 128 204 122"/>
+    </g>
+  </g>
+
+  <!-- magnifying glass over the lower right: stained cells under the lens -->
+  <g clip-path="url(#lensclip)">
+    <circle cx="182" cy="178" r="40" fill="url(#lensbg)"/>
+    <g filter="url(#glow)">
+      <g fill="none" stroke="#4dff7c" stroke-width="3">
+        <circle cx="166" cy="162" r="13"/>
+        <circle cx="198" cy="168" r="12"/>
+        <circle cx="176" cy="198" r="12"/>
+        <circle cx="208" cy="200" r="10"/>
+      </g>
+      <g fill="#3b6bff">
+        <circle cx="166" cy="162" r="7"/>
+        <circle cx="198" cy="168" r="6.5"/>
+        <circle cx="176" cy="198" r="6.5"/>
+        <circle cx="208" cy="200" r="5.5"/>
+        <circle cx="150" cy="186" r="5"/>
+      </g>
+      <g fill="#ff4fb0">
+        <circle cx="184" cy="146" r="3.5"/>
+        <circle cx="160" cy="210" r="3"/>
+        <circle cx="214" cy="180" r="3"/>
+        <circle cx="186" cy="182" r="2.5"/>
+      </g>
+    </g>
+  </g>
+  <circle cx="182" cy="178" r="40" fill="none" stroke="#e8ecf5" stroke-width="9"/>
+  <path d="M211 207 L232 228" stroke="#e8ecf5" stroke-width="14" stroke-linecap="round"/>
+  <path d="M155 156 A32 32 0 0 1 175 144" fill="none" stroke="#ffffff" stroke-width="4"
+        stroke-linecap="round" opacity="0.55"/>
+</svg>

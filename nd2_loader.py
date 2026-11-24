@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -89,8 +90,22 @@ COLOR_PALETTES: dict[str, dict[str, tuple[float, float, float]]] = {
 DEFAULT_PALETTE = "Vivid"
 _active_palette = DEFAULT_PALETTE
 
-# User-saved palettes live outside version control, under the app folder.
-_PALETTES_DIR = os.path.join(os.path.dirname(__file__), "palettes")
+def _palettes_dir() -> str:
+    """Where user-saved palettes live: next to the code when run from source
+    (git-ignored), or the per-user data folder in a packaged build, whose own
+    folder may be read-only (Program Files, a signed .app bundle)."""
+    if not getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(__file__), "palettes")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "glnd2", "palettes")
+
+
+_PALETTES_DIR = _palettes_dir()
 _CUSTOM_PALETTES_FILE = os.path.join(_PALETTES_DIR, "custom_palettes.json")
 
 

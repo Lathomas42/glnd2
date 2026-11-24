@@ -5,3 +5,5 @@ __pycache__/
 lut_preset.json
 palettes/
 .venv/
+build/
+dist/

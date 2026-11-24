@@ -3,6 +3,8 @@ import shutil
 import subprocess
 import sys
 
+_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "glnd2.png")
+
 
 def _nvidia_gpu_usable() -> bool:
     """True if an NVIDIA driver is installed *and working*. A driver whose
@@ -31,11 +33,43 @@ def _ensure_discrete_gpu():
     os.execve(sys.executable, args, env)
 
 
+def _self_check(nd2_paths: list[str]) -> int:
+    """`--check [file.nd2 ...]`: verify a packaged build is complete (every
+    module, the shaders, the TIFF/PNG writers, and reading any given ND2
+    files) without needing a display or GPU."""
+    import tempfile
+
+    import numpy as np
+    import tifffile
+    from PIL import Image
+
+    import gl_widget
+    import main_window  # noqa: F401  (pulls in the rest of the app)
+    import nd2_loader
+
+    for name in ("composite.vert", "composite.frag"):
+        with open(os.path.join(gl_widget._SHADER_DIR, name)) as f:
+            assert "#version" in f.read(), name
+    assert os.path.isfile(_ICON_PATH), _ICON_PATH
+    arr = np.zeros((4, 4, 3), np.uint8)
+    with tempfile.TemporaryDirectory() as tmp:
+        tifffile.imwrite(os.path.join(tmp, "t.tif"), arr, photometric="rgb")
+        Image.fromarray(arr).save(os.path.join(tmp, "t.png"))
+    for path in nd2_paths:
+        img = nd2_loader.load_nd2(path)
+        print(f"{os.path.basename(path)}: {img.width}x{img.height}, "
+              + ", ".join(f"{c.display_name} bg={c.stats.background:.0f}" for c in img.channels))
+    print("glnd2 self-check OK")
+    return 0
+
+
 def main():
+    if sys.argv[1:2] == ["--check"]:
+        sys.exit(_self_check(sys.argv[2:]))
     _ensure_discrete_gpu()
 
     from PySide6.QtCore import QCoreApplication, Qt
-    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtGui import QIcon, QSurfaceFormat
     from PySide6.QtWidgets import QApplication
 
     from gl_widget import default_gl_format
@@ -45,6 +79,7 @@ def main():
     # Lets the loader thread upload textures the viewer can use directly.
     QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(_ICON_PATH))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
