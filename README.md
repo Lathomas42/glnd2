@@ -13,9 +13,12 @@ fragment shader, so dragging sliders stays instant regardless of image size.
 Ready-made apps are on the repo's **Releases** page (or, for the latest
 build, the **Actions** tab > **Build** > a run > *Artifacts*):
 
-- **Windows**: unzip `glnd2-windows-x64.zip`, run `glnd2\glnd2.exe`. Keep the
-  `_internal` folder next to it. If SmartScreen warns about an unrecognized
-  app, choose *More info* > *Run anyway*.
+- **Windows**: run `glnd2-windows-x64-setup.exe`. It installs for just you
+  (no admin rights needed) and adds glnd2 to the Start Menu; uninstall from
+  *Settings* > *Apps*. Installing a newer version upgrades in place. If
+  SmartScreen warns about an unrecognized app, choose *More info* >
+  *Run anyway*. For a portable copy instead, unzip `glnd2-windows-x64.zip`
+  and run `glnd2\glnd2.exe` (keep the `_internal` folder next to it).
 - **macOS**: unzip and drag `glnd2.app` to Applications (`macos-arm64` for
   Apple Silicon, `macos-x64` for Intel). The app is unsigned, so the first
   launch is blocked: open *System Settings* > *Privacy & Security* and click
@@ -89,6 +92,7 @@ has to upload it to the GPU.
 - `nd2_loader.py`: ND2 reading, intensity stats, auto-contrast, palettes
 - `export_dialog.py`, `roi_store.py`, `file_lut_store.py`
 - `icons/`: app icon (`glnd2.svg`; `make_icons.py` regenerates the rest)
+- `glnd2.spec`, `installer/glnd2.iss`: PyInstaller build and Windows installer
 
 ## Building the apps
 

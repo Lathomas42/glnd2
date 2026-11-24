@@ -1,12 +1,15 @@
 # Builds standalone glnd2 apps for Windows, macOS and Linux with PyInstaller.
 #   - Actions tab > "Build" > Run workflow: builds downloadable artifacts.
 #   - Pushing a tag like v0.2.0: also publishes them as a GitHub Release.
+#   - Pushing changes to the build setup itself: builds, to catch breakage.
 name: Build
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths: [glnd2.spec, installer/**, .github/workflows/build.yml, requirements.txt]
 
 jobs:
   build:
@@ -63,6 +66,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path dist\glnd2 -DestinationPath glnd2-${{ matrix.name }}.zip
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "dev" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\glnd2.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+      - name: Installer self-check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\glnd2-install"
+          $p = Start-Process -FilePath .\glnd2-windows-x64-setup.exe -ArgumentList '/VERYSILENT', '/CURRENTUSER', "/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "install failed: $($p.ExitCode)" }
+          $p = Start-Process -FilePath "$dir\glnd2.exe" -ArgumentList '--check' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installed self-check failed: $($p.ExitCode)" }
       - name: Package (macOS)
         if: runner.os == 'macOS'
         # ditto keeps the bundle's symlinks and code signature intact.
@@ -74,7 +94,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: glnd2-${{ matrix.name }}
-          path: glnd2-${{ matrix.name }}.*
+          path: |
+            glnd2-${{ matrix.name }}.*
+            glnd2-${{ matrix.name }}-setup.exe
           if-no-files-found: error
 
   release:
